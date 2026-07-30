@@ -1,0 +1,87 @@
+html, body, #shot-root {
+  margin: 0;
+  height: 100%;
+  background: transparent;
+  overflow: hidden;
+}
+
+.shot {
+  width: 100vw;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start; /* 图按原宽左对齐，不被拉伸到窗口宽 */
+  cursor: pointer;
+  background: transparent;
+}
+
+/* 截图 + 覆盖层（宽=disp_w 由内联设定，不拉伸）；工具条在其下方，不压译文 */
+.imgwrap {
+  position: relative;
+}
+.imgwrap > img {
+  display: block;
+  width: 100%;
+}
+
+/* 每行译文盖在原文原位：深蓝底覆盖原文(min-width=原框宽)、全行统一字号(内联)、左上锚点。
+   译文比原文长→在 min~max 宽间自适应、到图右缘前换行(不裁不越界)；比原文矮→min-height 补齐盖住原文。 */
+.ln {
+  position: absolute;
+  display: flex;
+  align-items: center;
+  width: max-content; /* 按内容宽定盒子：短译文就一行，不再被收缩成竖排堆叠 */
+  box-sizing: border-box;
+  color: #f4f7ff;
+  background: rgba(16, 42, 82, 0.95);
+  padding: 1px 5px;
+  border-radius: 3px;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.12);
+  line-height: 1.18;
+  font-weight: 400;
+  white-space: normal;
+  overflow-wrap: break-word; /* 只有超过 max-width(图右缘)时才断，长英文单词也能断；不逐字断 */
+  word-break: normal;
+  font-family: "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+}
+
+/* 底部工具条：图下方独立条带，不遮挡文字 */
+.bar {
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 8px;
+  background: rgba(20, 20, 22, 0.96);
+  cursor: default;
+  font-family: "Noto Sans SC", sans-serif;
+}
+.bar .b {
+  font-size: 12px;
+  border: none;
+  border-radius: 6px;
+  padding: 4px 12px;
+  cursor: pointer;
+  background: rgba(255, 255, 255, 0.16);
+  color: #fff;
+  font-family: inherit;
+}
+.bar .b:hover {
+  background: rgba(255, 255, 255, 0.28);
+}
+.bar .b.primary {
+  background: #0a84ff;
+  font-weight: 600;
+}
+.bar .b.primary:hover {
+  background: #0060df;
+}
+.bar .tip {
+  font-size: 10px;
+  color: rgba(255, 255, 255, 0.65);
+  padding: 0 4px;
+  margin-right: auto;
+}

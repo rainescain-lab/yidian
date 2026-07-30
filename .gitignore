@@ -1,0 +1,26 @@
+# deps / build
+node_modules/
+dist/
+src-tauri/target/
+app/src-tauri/target/
+*.log
+
+# 打包附带的大资源(如 PaddleOCR-json 引擎，构建时放入，勿入 git)
+app/src-tauri/resources/
+
+# 打包产物（安装包等二进制，走 GitHub Releases 分发，不入 git）
+*.exe
+
+# brainstorm scratch (visual companion)
+.superpowers/
+
+# local data / secrets
+*.db
+*.sqlite
+/dict-data/
+.env
+.env.*
+
+# os
+Thumbs.db
+.DS_Store

@@ -1,0 +1,37 @@
+html, body, #overlay-root {
+  margin: 0;
+  height: 100%;
+  background: transparent; /* 透明窗必须：让桌面透出，仅选区外由 box-shadow 压暗 */
+  overflow: hidden;
+  cursor: crosshair;
+  user-select: none;
+}
+.ov {
+  position: fixed;
+  inset: 0;
+}
+/* 刚弹出、还没开始拖：压暗全屏，让"截图模式"一眼可辨，不再被误当卡死。
+   一旦开始拖框(有 .sel)就去掉整屏压暗，改由 .sel 的 box-shadow 只压暗选区外、选区内清晰。 */
+.ov.idle {
+  background: rgba(0, 0, 0, 0.34);
+}
+.sel {
+  position: fixed;
+  border: 1.5px solid #0a84ff;
+  background: rgba(10, 132, 255, 0.1);
+  box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.35); /* 选区外压暗 */
+}
+.hint {
+  position: fixed;
+  top: 32px;
+  left: 50%;
+  transform: translateX(-50%);
+  color: #fff;
+  background: rgba(10, 132, 255, 0.92);
+  padding: 10px 20px;
+  border-radius: 12px;
+  font: 600 15px -apple-system, "Noto Sans SC", "Microsoft YaHei", sans-serif;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+  pointer-events: none;
+  white-space: nowrap;
+}

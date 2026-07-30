@@ -1,0 +1,73 @@
+/* popup 窗口透明：只显中间那张圆角卡片 */
+html, body, #popup-root {
+  background: transparent !important;
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+}
+
+.pop {
+  height: 100vh;
+  padding: 10px; /* 给阴影留空间 */
+  box-sizing: border-box;
+}
+
+.pop-card {
+  height: 100%;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  box-shadow: var(--shadow-md);
+  padding: 16px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  overflow-y: auto;
+}
+
+.pop-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.pop-tag {
+  font-size: 11px;
+  color: var(--sub);
+  background: var(--surface-2);
+  border-radius: 6px;
+  padding: 3px 9px;
+}
+.pop-copy {
+  margin-left: auto;
+  font-size: 12px;
+  color: var(--sub);
+  background: var(--surface-2);
+  border: none;
+  border-radius: 7px;
+  padding: 6px 12px;
+  cursor: pointer;
+  font-family: inherit;
+}
+.pop-copy:hover {
+  color: var(--ink);
+  background: var(--line);
+}
+
+.pop-src {
+  font-size: 14px;
+  line-height: 1.65;
+  color: var(--sub);
+  white-space: pre-wrap;
+  word-break: break-word;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--line);
+}
+.pop-dst {
+  font-size: 20px;
+  line-height: 1.8;
+  color: var(--ink);
+  letter-spacing: -0.01em;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-weight: 450;
+}
