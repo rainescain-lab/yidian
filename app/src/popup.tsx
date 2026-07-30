@@ -26,14 +26,12 @@ function Popup() {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") close();
     };
-    // 点别处消失：blur 仅在窗口曾获焦后才触发，不会导致"从未获焦→瞬间消失"
+    // 不再用 blur 自关：弹窗不抢焦点（后端 focused(false)），blur 会导致创建瞬间消失（"无法唤醒"）。
+    // 关闭只由：× 按钮 / Esc / 超时。下一次划词会自动替换旧弹窗。
     window.addEventListener("keydown", onKey);
-    window.addEventListener("blur", close);
-    // 兜底：18s 后自动收起
-    const timer = window.setTimeout(close, 18000);
+    const timer = window.setTimeout(close, 12000);
     return () => {
       window.removeEventListener("keydown", onKey);
-      window.removeEventListener("blur", close);
       window.clearTimeout(timer);
     };
   }, []);

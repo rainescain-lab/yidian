@@ -358,7 +358,7 @@ fn show_popup(app: &AppHandle, src: &str, dst: &str, engine: &str, pos: Physical
         .shadow(false)
         .inner_size(440.0, 280.0)
         .visible(false)
-        .focused(true)
+        .focused(false)
         .build()
     {
         Ok(p) => p,
@@ -369,9 +369,9 @@ fn show_popup(app: &AppHandle, src: &str, dst: &str, engine: &str, pos: Physical
     };
     let _ = popup.set_position(pos);
     let _ = popup.show();
-    let _ = popup.set_focus();
-    // 不在此处按焦点自关：全局热键触发时 app 常非前台，popup 未必拿得到焦点，
-    // 按 Focused(false) 关会导致创建瞬间自关。关闭改由前端负责（点别处 JS blur / Esc / × / 超时）。
+    // 关键：不抢焦点、不 set_focus。全局热键触发时窗口拿不稳前台焦点，若 focused(true)+前端 blur 自关，
+    // 会一获焦立刻失焦→blur→弹窗创建瞬间消失（用户感知“划词无法唤醒”）；且抢走源程序焦点会害下一次
+    // 划词的 Ctrl+C 复制到空（len=0）。故弹窗只做常驻置顶卡片，关闭由前端 × / 超时负责。
 }
 
 /// 图像内嵌翻译结果窗：铺在被截区域原位，显示截图 + 逐行译文覆盖在原文上。
@@ -512,6 +512,10 @@ async fn start_screenshot(app: AppHandle) {
     let _ = win.set_size(PhysicalSize::new(info.w, info.h));
     let _ = win.show();
     let _ = win.set_focus();
+    // 关键：全局热键触发时本 app 非前台，Windows 前台锁会让新遮罩窗抢不到前台→webview 不激活/不绘制，
+    // 表现为"要点一下才出现"。用 AttachThreadInput 绕过前台锁强制拉到前台，做到每次直接唤醒。
+    #[cfg(windows)]
+    force_foreground(&win);
     diag_log(
         &app,
         &format!("start_screenshot: overlay shown at {},{} {}x{}", info.x, info.y, info.w, info.h),
@@ -551,6 +555,7 @@ async fn start_selection(app: AppHandle) {
     let s;
     let t;
     let label;
+    let t0 = std::time::Instant::now();
     {
         let st = app.state::<AppState>();
         match run_translate(st.inner(), &text, engine).await {
@@ -561,11 +566,20 @@ async fn start_selection(app: AppHandle) {
                 label = v.3;
             }
             Err(e) => {
-                eprintln!("划词翻译失败: {e}");
+                diag_log(&app, &format!("start_selection: 翻译失败(不弹窗) {e}"));
                 return;
             }
         }
     }
+    diag_log(
+        &app,
+        &format!(
+            "start_selection: 翻译完成 引擎={} 耗时={}ms 译文len={}",
+            label,
+            t0.elapsed().as_millis(),
+            translated.len()
+        ),
+    );
     {
         let st = app.state::<AppState>();
         record_history(st.inner(), &text, &translated, s, t, &label);
@@ -583,6 +597,34 @@ fn show_main(app: &AppHandle) {
         let _ = w.unminimize();
         let _ = w.show();
         let _ = w.set_focus();
+    }
+}
+
+/// 绕过 Windows 前台锁把窗口强制拉到前台并激活（全局热键触发时 app 非前台，SetForegroundWindow
+/// 会被静默拒绝→窗口不激活/webview 不绘制）。用 AttachThreadInput 附到当前前台线程输入队列再抢前台。
+#[cfg(windows)]
+fn force_foreground(win: &tauri::WebviewWindow) {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        BringWindowToTop, GetForegroundWindow, GetWindowThreadProcessId, SetForegroundWindow,
+        ShowWindow, SW_SHOW,
+    };
+    let hwnd = match win.hwnd() {
+        Ok(h) => HWND(h.0 as *mut core::ffi::c_void),
+        Err(_) => return,
+    };
+    unsafe {
+        let fg = GetForegroundWindow();
+        let fg_thread = GetWindowThreadProcessId(fg, None);
+        let cur_thread = GetCurrentThreadId();
+        let attached = AttachThreadInput(fg_thread, cur_thread, true.into()).as_bool();
+        let _ = ShowWindow(hwnd, SW_SHOW);
+        let _ = BringWindowToTop(hwnd);
+        let _ = SetForegroundWindow(hwnd);
+        if attached {
+            let _ = AttachThreadInput(fg_thread, cur_thread, false.into());
+        }
     }
 }
 
