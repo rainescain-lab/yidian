@@ -306,9 +306,25 @@ fn diag_log(app: &AppHandle, msg: &str) {
             .open(dir.join("diag.log"))
         {
             use std::io::Write;
-            let _ = writeln!(f, "{msg}");
+            let _ = writeln!(f, "[{}] {msg}", log_stamp());
         }
     }
+}
+
+/// 日志时间戳（本地时间）。没有时间戳时无法把日志行和用户的实际操作对上。
+#[cfg(windows)]
+fn log_stamp() -> String {
+    use windows::Win32::System::SystemInformation::GetLocalTime;
+    let t = unsafe { GetLocalTime() };
+    format!(
+        "{:02}-{:02} {:02}:{:02}:{:02}.{:03}",
+        t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond, t.wMilliseconds
+    )
+}
+
+#[cfg(not(windows))]
+fn log_stamp() -> String {
+    String::new()
 }
 
 /// 在锚点附近放窗，超出所在屏就往反方向翻转 + 夹进屏内。win_w/h 为窗口逻辑尺寸。
@@ -537,14 +553,16 @@ async fn start_screenshot(app: AppHandle) {
 
 /// Alt+W：取选区 → 翻译 → 光标旁弹卡。
 async fn start_selection(app: AppHandle) {
-    let sel = tauri::async_runtime::spawn_blocking(selection::grab_selection)
+    let (sel, grab_diag) = tauri::async_runtime::spawn_blocking(selection::grab_selection)
         .await
-        .ok()
-        .flatten();
+        .unwrap_or_else(|e| (None, vec![format!("    spawn_blocking 崩了: {e}")]));
     diag_log(
         &app,
         &format!("start_selection: got selection len={}", sel.as_deref().map(str::len).unwrap_or(0)),
     );
+    for line in &grab_diag {
+        diag_log(&app, line);
+    }
     let text = match sel {
         Some(t) if !t.trim().is_empty() => t,
         _ => return,
@@ -566,7 +584,10 @@ async fn start_selection(app: AppHandle) {
                 label = v.3;
             }
             Err(e) => {
-                diag_log(&app, &format!("start_selection: 翻译失败(不弹窗) {e}"));
+                // 以前这里是静默 return：翻译失败在界面上和「划词压根没生效」长得一模一样，
+                // 用户只看到"划了词什么都没发生"，也无从判断该看哪儿。失败必须可见。
+                diag_log(&app, &format!("start_selection: 翻译失败 {e}"));
+                show_popup(&app, &text, &format!("翻译失败：{e}"), "错误", selection_popup_pos(&app));
                 return;
             }
         }
@@ -584,11 +605,14 @@ async fn start_selection(app: AppHandle) {
         let st = app.state::<AppState>();
         record_history(st.inner(), &text, &translated, s, t, &label);
     }
-    let pos = app
-        .cursor_position()
-        .map(|c| place_near(&app, PhysicalPosition::new(c.x as i32, c.y as i32), 440.0, 280.0))
-        .unwrap_or(PhysicalPosition::new(200, 200));
-    show_popup(&app, &text, &translated, &label, pos);
+    show_popup(&app, &text, &translated, &label, selection_popup_pos(&app));
+}
+
+/// 划词卡片的落点：光标旁，超出所在屏就翻转并夹回屏内。
+fn selection_popup_pos(app: &AppHandle) -> PhysicalPosition<i32> {
+    app.cursor_position()
+        .map(|c| place_near(app, PhysicalPosition::new(c.x as i32, c.y as i32), 440.0, 280.0))
+        .unwrap_or(PhysicalPosition::new(200, 200))
 }
 
 /// 显示主界面（从托盘或隐藏态唤回并聚焦）。
