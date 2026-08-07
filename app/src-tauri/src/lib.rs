@@ -2,6 +2,8 @@ mod capture;
 mod db;
 mod dict;
 mod engine;
+mod hotkey;
+mod hotkey_vk;
 mod ocr;
 mod selection;
 
@@ -22,6 +24,29 @@ pub struct AppState {
     popup_payload: Mutex<Option<PopupPayload>>,
     shot_payload: Mutex<Option<ShotPayload>>,
     paddle: Mutex<Option<ocr::paddle::Paddle>>,
+    /// 交互式翻译的代次 + 最新一次的原文。
+    ///
+    /// 历史表按 `source_text` UPSERT，谁最后落库谁赢 —— 而前端的 `reqId` 只能取消**显示**，
+    /// 取消不了已经发出去的后端请求。于是"同一段文字换个方向重译"时，若旧请求走得慢
+    /// （撞上 Bing token 过期→重取 token→在线失败→本地 Qwen 兜底，10s 量级）、新请求走得快
+    /// （热 token 300ms），界面显示新方向的译文，历史行却被随后落地的旧请求盖回旧方向，
+    /// 而且不会触发任何刷新 —— 两个页面自相矛盾且无从察觉。
+    /// 所以落库前先确认自己仍是**这段原文**最新的那一次。
+    req_seq: std::sync::atomic::AtomicU64,
+    latest_req: Mutex<(String, u64)>,
+    /// 主界面上手选的翻译方向。**会话内 sticky、不落盘**。
+    ///
+    /// 手选是"我这会儿要把这段译成日文"这种**任务级意图**，不是偏好：下次开软件理应回到
+    /// 自动。落盘的话，用户某天为了一句话把方向钉成日文，几周后打开软件发现所有翻译都成了
+    /// 日文却想不起为什么——这类残留状态的排查成本远高于它省下的那一次点击。
+    manual_dir: Mutex<ManualDir>,
+}
+
+/// 手选方向。`None` = 那一侧交给自动规则。
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ManualDir {
+    pub src: Option<String>,
+    pub tgt: Option<String>,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -113,27 +138,150 @@ fn record_history(
     .unwrap_or((0, false))
 }
 
-/// 统一翻译：按 engine(local|online) 路由，返回 (译文, 源语言, 目标语言, 引擎名)。
+/// 这一次翻译到底按什么方向走。
+#[derive(Debug, Clone, PartialEq)]
+struct Direction {
+    /// 源语言名（喂 prompt、记历史）。
+    src: String,
+    /// 目标语言名。
+    tgt: String,
+    /// 源语言是**用户手选**的吗？
+    ///
+    /// 只有 true 时才把源语言传给在线引擎。false 时一律让引擎自己 `auto` 识别——
+    /// 我们的脚本规则在"只含汉字的日语"这类情况上原理性地分不出来（`lang.rs` 的已知盲区），
+    /// 拿它去顶掉引擎的自动识别只会更差。
+    src_manual: bool,
+}
+
+/// 读母语设置，值坏掉/没登记时回落到出厂默认。
+///
+/// 这里的回落是**配置健全性兜底**，不是"翻译结果降级"：拿一个不在语言表里的名字去调引擎，
+/// Google 会返回 200 且原样不翻译（连报错都没有），用户只会觉得软件坏了。写入侧
+/// （`settings_set`）已经拦了一道，这里兜住历史脏数据。
+fn read_native_pair(state: &AppState) -> (String, String) {
+    let get = |k: &str, d: &str, ok: fn(&str) -> bool| -> String {
+        let v = state
+            .db
+            .lock()
+            .ok()
+            .and_then(|c| db::get_setting(&c, k).ok().flatten());
+        match v {
+            Some(s) if ok(&s) => s,
+            _ => d.to_string(),
+        }
+    };
+    (
+        // 母语的判据比目标语言严，理由见 is_native_selectable
+        get("native_lang", "Chinese", engine::online::is_native_selectable),
+        get("native_to", "English", engine::online::is_supported),
+    )
+}
+
+/// 算出本次翻译的方向。
+///
+/// `follow_manual = false` 时完全忽略主界面的手选（划词/截图默认走这条，见
+/// `selection_follow_manual` 设置项：划词离 UI 最远，最容易被残留的手选状态咬）。
+fn resolve_direction(state: &AppState, text: &str, follow_manual: bool) -> Direction {
+    let (native, native_to) = read_native_pair(state);
+    let manual = if follow_manual {
+        state.manual_dir.lock().map(|g| g.clone()).unwrap_or_default()
+    } else {
+        ManualDir::default()
+    };
+
+    let (auto_src, auto_tgt) = engine::lang::direction_with_native(text, &native, &native_to);
+    let src_manual = manual.src.is_some();
+    let src = manual.src.unwrap_or(auto_src);
+    // 只钉了源语言时，目标仍按"母语→native_to，其他→母语"这条规则现算 ——
+    // 不能直接用 auto_tgt，它是按**自动判出来的源语言**算的，跟用户钉的这个可能不是一回事。
+    let by_rule = |s: &str| {
+        if s == native {
+            native_to.clone()
+        } else {
+            native.clone()
+        }
+    };
+    let tgt_manual = manual.tgt.is_some();
+    let mut tgt = match manual.tgt {
+        Some(t) => t,
+        None if src_manual => by_rule(&src),
+        None => auto_tgt,
+    };
+
+    // 同语言保护：src==tgt 时引擎会原样返回，界面上看着就是"翻了跟没翻一样"。
+    //
+    // ⚠ 但**不能拿一个猜出来的源去否决用户明选的目标**（2026-08-07 对抗复核揪出）：
+    // src_manual=false 时 src 只是我们的脚本判定，而且**根本不会发给在线引擎**（走 sl=auto）。
+    // 典型踩法：用户把目标选成中文、翻 `東京都新宿区`（只含汉字的日语，脚本层必判成中文，
+    // 见 lang.rs 已知盲区）→ 保护触发 → 目标被悄悄改成英文 → 引擎自己识别出日语、译成英文。
+    // 用户明明选了"译成中文"，拿到的是英文，界面上还显示着中文，毫无提示。
+    // 所以：目标是用户明选的、而源只是猜的时候，让步的必须是猜测，不是用户的选择。
+    let respect_tgt = tgt_manual && !src_manual;
+    if tgt == src && !respect_tgt {
+        tgt = by_rule(&src);
+        if tgt == src {
+            // 病态配置（native == native_to）才会走到这儿，给一个必定不同的落点。
+            tgt = if src == "English" { "Chinese" } else { "English" }.to_string();
+        }
+    }
+
+    Direction {
+        src,
+        tgt,
+        src_manual,
+    }
+}
+
+/// 认领一次交互式翻译，返回本次代次。见 `AppState.req_seq`。
+fn claim_request(state: &AppState, text: &str) -> u64 {
+    let gen = state
+        .req_seq
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        + 1;
+    if let Ok(mut g) = state.latest_req.lock() {
+        *g = (text.to_string(), gen);
+    }
+    gen
+}
+
+/// 这一次的结果还该不该写进历史。
+///
+/// ⚠ 按**原文**比对而不是全局代次：只压掉"同一行的过期写入"，不能误伤打字防抖期间
+/// 那些原文各不相同的条目（它们各写各的行，谁也不盖谁）。
+fn is_superseded(state: &AppState, text: &str, gen: u64) -> bool {
+    state
+        .latest_req
+        .lock()
+        .map(|g| g.0 == text && g.1 != gen)
+        .unwrap_or(false)
+}
+
+/// 统一翻译：按 engine(local|online) 路由，返回 (译文, 引擎名)。方向由调用方给定。
 async fn run_translate(
     state: &AppState,
     text: &str,
     engine: &str,
-) -> Result<(String, &'static str, &'static str, String), String> {
-    let (src, tgt) = engine::lang::default_direction(text);
-    let (translated, label) = if engine == "online" {
+    dir: &Direction,
+) -> Result<(String, String), String> {
+    // 源语言只有在用户手选时才传给在线引擎，理由见 Direction::src_manual。
+    let online_src = dir.src_manual.then(|| dir.src.as_str());
+    if engine == "online" {
         let order = read_online_order(state);
-        match engine::online::translate_online(text, tgt, &order).await {
-            Ok(v) => v,
-            // 在线失败(网络卡/超时/被墙) → 本地 Qwen 兜底
-            Err(e) => match engine::ollama::translate_local(text).await {
-                Ok(t) => (t, "本地(兜底)".to_string()),
-                Err(e2) => return Err(format!("在线失败({e})、本地兜底也失败({e2})")),
+        match engine::online::translate_online(text, online_src, &dir.tgt, &order).await {
+            Ok(v) => Ok(v),
+            // 在线失败(网络卡/超时/被墙) → 本地 Qwen 兜底。
+            // ⚠ 必须把 src/tgt 一并传下去：不传的话，网络一卡方向就**静默打回默认**，
+            // 用户手选的方向在兜底路径上悄悄失效（2026-08-07）。
+            Err(e) => match engine::ollama::translate_local(text, &dir.src, &dir.tgt).await {
+                Ok(t) => Ok((t, "本地(兜底)".to_string())),
+                Err(e2) => Err(format!("在线失败({e})、本地兜底也失败({e2})")),
             },
         }
     } else {
-        (engine::ollama::translate_local(text).await?, "本地".to_string())
-    };
-    Ok((translated, src, tgt, label))
+        engine::ollama::translate_local(text, &dir.src, &dir.tgt)
+            .await
+            .map(|t| (t, "本地".to_string()))
+    }
 }
 
 #[tauri::command]
@@ -153,16 +301,31 @@ async fn translate(
         });
     }
 
-    let (translated, src, tgt, engine_label) =
-        run_translate(state.inner(), &text, &engine).await?;
+    let gen = claim_request(state.inner(), &text);
 
-    let (history_id, favorite) =
-        record_history(state.inner(), &text, &translated, src, tgt, &engine_label);
+    // 主界面一定听手选（那个下拉框就在用户眼前，不听它才是 bug）。
+    let dir = resolve_direction(state.inner(), &text, true);
+    let (translated, engine_label) = run_translate(state.inner(), &text, &engine, &dir).await?;
+
+    // 这段原文已经被更新的一次翻过了 ⇒ 不许回写历史（详见 AppState.req_seq）。
+    // 返回 history_id=0：此时前端那边这次响应本来也会被 reqId 丢掉，★收藏按钮不受影响。
+    let (history_id, favorite) = if is_superseded(state.inner(), &text, gen) {
+        (0, false)
+    } else {
+        record_history(
+            state.inner(),
+            &text,
+            &translated,
+            &dir.src,
+            &dir.tgt,
+            &engine_label,
+        )
+    };
 
     Ok(TranslateOut {
         text: translated,
-        src_lang: src.to_string(),
-        tgt_lang: tgt.to_string(),
+        src_lang: dir.src,
+        tgt_lang: dir.tgt,
         engine: engine_label,
         history_id,
         favorite,
@@ -214,6 +377,23 @@ fn settings_get_all(state: State<AppState>) -> Result<HashMap<String, String>, S
 
 #[tauri::command]
 fn settings_set(state: State<AppState>, key: String, value: String) -> Result<(), String> {
+    // 语言类设置在**写入侧**就挡住不认识的值。放进去再说的话，故障要等到下一次翻译才现形，
+    // 而且现形方式是 Google 返回 200 且原样不翻译（连报错都没有）—— 极难往设置上想。
+    if key == "native_to" && !engine::online::is_supported(&value) {
+        return Err(format!("不支持的语言「{value}」"));
+    }
+    // 母语比目标语言严：它要参与「这段是不是母语」的比较，必须落在脚本判定的值域里。
+    // 详见 engine::online::is_native_selectable。
+    if key == "native_lang" && !engine::online::is_native_selectable(&value) {
+        return Err(format!(
+            "「{value}」不能当母语——译点分不出这门语言的原文（拉丁字母各语言在字符层面一样），\
+             把它选成「母语译成」的目标是可以的"
+        ));
+    }
+    // 热键不走这条路：它要真的去注册、要处理失败与冲突，见 hotkey_set。
+    if key.starts_with("hotkey_") {
+        return Err("快捷键请用「修改」按钮设置（需要真正注册才算数）".into());
+    }
     let conn = state.db.lock().map_err(|e| e.to_string())?;
     db::set_setting(&conn, &key, &value).map_err(|e| e.to_string())
 }
@@ -465,7 +645,11 @@ fn edit_in_main(app: AppHandle, text: String) {
     }
 }
 
-/// Alt+Q：在光标所在屏建全屏透明 overlay 供拖框。
+/// 遮罩代次：每成功开出一个遮罩 +1。安全网计时器凭它认领"自己那一代"，
+/// 免得 15s 后误杀后来新开的遮罩（详见 `start_screenshot` 末尾）。
+static OVERLAY_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 截图热键（默认 Alt+Q）：在光标所在屏建全屏透明 overlay 供拖框。
 async fn start_screenshot(app: AppHandle) {
     // 连按 Alt+Q / 上次遮罩没完成：只关掉旧遮罩并返回，绝不在同一次调用里 close 后又以同 label rebuild
     //（同标签窗口边关边建会与主线程事件循环竞态 → build 阻塞在等 label 释放 → 主线程死锁 = 假死）。
@@ -524,6 +708,8 @@ async fn start_screenshot(app: AppHandle) {
             return;
         }
     };
+    // 本次遮罩的代次。安全网计时器只认自己这一代，理由见下面那段。
+    let my_gen = OVERLAY_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
     let _ = win.set_position(PhysicalPosition::new(info.x, info.y));
     let _ = win.set_size(PhysicalSize::new(info.w, info.h));
     let _ = win.show();
@@ -534,54 +720,103 @@ async fn start_screenshot(app: AppHandle) {
     force_foreground(&win);
     diag_log(
         &app,
-        &format!("start_screenshot: overlay shown at {},{} {}x{}", info.x, info.y, info.w, info.h),
+        &format!(
+            "start_screenshot: overlay#{my_gen} shown at {},{} {}x{}",
+            info.x, info.y, info.w, info.h
+        ),
     );
     // 安全网：遮罩是全屏置顶窗，一旦它的 webview 卡住/失焦收不到 Esc，就会挡死全屏所有点击
-    //（连任务栏/托盘都点不动）。这里后端起一个独立计时器，25s 内若遮罩还在（既没截图也没取消），
+    //（连任务栏/托盘都点不动）。这里后端起一个独立计时器，15s 内若遮罩还在（既没截图也没取消），
     // 强制关掉它——不依赖那个可能卡住的 webview，保证屏幕绝不会被永久锁死。
+    //
+    // ⚠ 必须按**代次**认领，不能只按窗口 label 关（2026-08-07 对抗复核揪出）：计时器只捕获
+    // AppHandle，15s 后 `get_webview_window("overlay")` 拿到的是**当时**那个遮罩，可能已经是
+    // 后来新开的第二个。而截图翻译的自然节奏（按键→拖框→OCR+翻译→看结果→再按）通常远短于
+    // 15s，于是稳态下新遮罩的存活上限 = 15s 减去上一轮已经走掉的时间 —— 表现为"遮罩自己没了/
+    // 拖到一半框消失"，日志还谎报"15s 超时"，把排查引向 webview 卡死这个错方向。
     {
         let app2 = app.clone();
         tauri::async_runtime::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+            if OVERLAY_GEN.load(std::sync::atomic::Ordering::SeqCst) != my_gen {
+                return; // 这一代早已谢幕，屏幕上是后来那个，不许动
+            }
             if let Some(w) = app2.get_webview_window("overlay") {
                 let _ = w.close();
-                diag_log(&app2, "start_screenshot: 遮罩 15s 超时→后端强制关闭(安全网)");
+                diag_log(
+                    &app2,
+                    &format!("start_screenshot: 遮罩#{my_gen} 15s 超时→后端强制关闭(安全网)"),
+                );
             }
         });
     }
 }
 
-/// Alt+W：取选区 → 翻译 → 光标旁弹卡。
+/// 划词/截图是否继承主界面上手选的方向。默认否，理由见 `db.rs` 的 `selection_follow_manual`。
+fn selection_follows_manual(app: &AppHandle) -> bool {
+    read_setting_val(app, "selection_follow_manual").as_deref() == Some("1")
+}
+
+/// 划词热键（默认 Alt+W）：取选区 → 翻译 → 光标旁弹卡。
 async fn start_selection(app: AppHandle) {
-    let (sel, grab_diag) = tauri::async_runtime::spawn_blocking(selection::grab_selection)
+    // ⚠ 等键信息必须从**实际注册成功的那个热键**取，不能用"用户想要的那个"。
+    let hk = hotkey::global();
+    let keys = selection::Keys {
+        main_vk: hk.selection_main_vk(),
+        accel: hk.accel(hotkey::Action::Selection),
+    };
+    let accel = hk.accel(hotkey::Action::Selection);
+    let got = tauri::async_runtime::spawn_blocking(move || selection::grab_selection(keys))
         .await
-        .unwrap_or_else(|e| (None, vec![format!("    spawn_blocking 崩了: {e}")]));
+        .unwrap_or_else(|e| selection::GrabResult {
+            text: None,
+            keys_held: None,
+            diag: vec![format!("    spawn_blocking 崩了: {e}")],
+        });
     diag_log(
         &app,
-        &format!("start_selection: got selection len={}", sel.as_deref().map(str::len).unwrap_or(0)),
+        &format!(
+            "start_selection: got selection len={}",
+            got.text.as_deref().map(str::len).unwrap_or(0)
+        ),
     );
-    for line in &grab_diag {
+    for line in &got.diag {
         diag_log(&app, line);
     }
-    let text = match sel {
+    let text = match got.text {
         Some(t) if !t.trim().is_empty() => t,
-        _ => return,
+        _ => {
+            // 「等不到松手就放弃」必须说出来 —— 它是常态路径，而且用户自己就能修。
+            // 其它 sel=None（最常见的是"压根没选中文字"）保持静默：那种情况下弹卡
+            // 只会让每一次误按热键都糊一张卡片在屏幕上。
+            if let Some(still) = got.keys_held {
+                show_popup(
+                    &app,
+                    "",
+                    &format!(
+                        "按住 {} 不放，取不到选中的文字。\n按完就松手再试一次（放开时才会去取词）。\n\n（放弃时仍按着：{still}）",
+                        format_accel_zh(&accel)
+                    ),
+                    "划词",
+                    selection_popup_pos(&app),
+                );
+            }
+            return;
+        }
     };
     // 划词也默认在线(快)，网络卡时 run_translate 内部回退本地兜底
     let engine = "online";
     let translated;
-    let s;
-    let t;
     let label;
+    let dir;
     let t0 = std::time::Instant::now();
     {
         let st = app.state::<AppState>();
-        match run_translate(st.inner(), &text, engine).await {
+        dir = resolve_direction(st.inner(), &text, selection_follows_manual(&app));
+        match run_translate(st.inner(), &text, engine, &dir).await {
             Ok(v) => {
                 translated = v.0;
-                s = v.1;
-                t = v.2;
-                label = v.3;
+                label = v.1;
             }
             Err(e) => {
                 // 以前这里是静默 return：翻译失败在界面上和「划词压根没生效」长得一模一样，
@@ -595,7 +830,10 @@ async fn start_selection(app: AppHandle) {
     diag_log(
         &app,
         &format!(
-            "start_selection: 翻译完成 引擎={} 耗时={}ms 译文len={}",
+            "start_selection: 翻译完成 方向={}→{}{} 引擎={} 耗时={}ms 译文len={}",
+            dir.src,
+            dir.tgt,
+            if dir.src_manual { "(手选源)" } else { "" },
             label,
             t0.elapsed().as_millis(),
             translated.len()
@@ -603,7 +841,7 @@ async fn start_selection(app: AppHandle) {
     );
     {
         let st = app.state::<AppState>();
-        record_history(st.inner(), &text, &translated, s, t, &label);
+        record_history(st.inner(), &text, &translated, &dir.src, &dir.tgt, &label);
     }
     show_popup(&app, &text, &translated, &label, selection_popup_pos(&app));
 }
@@ -759,9 +997,16 @@ async fn overlay_capture(app: AppHandle, x: f64, y: f64, w: f64, h: f64) -> Resu
     // 先合并翻一次按行拆回；凡是对不上/空的行再逐行单独重翻补齐（修「漏翻译」）。
     let joined = lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join("\n");
     let engine = "online";
+    // 方向按**整块合并文本**算一次，后面补空的逐行重翻沿用同一个方向：
+    // 逐行各判各的会让同一张截图里的行译到不同语言去（英文行→中文、中文行→英文）。
+    let follow = selection_follows_manual(&app);
+    let dir = {
+        let st = app.state::<AppState>();
+        resolve_direction(st.inner(), &joined, follow)
+    };
     let translated_all = {
         let st = app.state::<AppState>();
-        run_translate(st.inner(), &joined, engine)
+        run_translate(st.inner(), &joined, engine, &dir)
             .await
             .map(|v| v.0)
             .unwrap_or_default()
@@ -779,7 +1024,7 @@ async fn overlay_capture(app: AppHandle, x: f64, y: f64, w: f64, h: f64) -> Resu
         let st = app.state::<AppState>();
         for (i, l) in lines.iter().enumerate() {
             if dsts[i].trim().is_empty() && !l.text.trim().is_empty() {
-                if let Ok(v) = run_translate(st.inner(), &l.text, engine).await {
+                if let Ok(v) = run_translate(st.inner(), &l.text, engine, &dir).await {
                     dsts[i] = v.0;
                 }
             }
@@ -792,7 +1037,7 @@ async fn overlay_capture(app: AppHandle, x: f64, y: f64, w: f64, h: f64) -> Resu
     ));
     {
         let st = app.state::<AppState>();
-        record_history(st.inner(), &joined, &translated_all, "-", "-", "截图");
+        record_history(st.inner(), &joined, &translated_all, &dir.src, &dir.tgt, "截图");
     }
     let shot_lines: Vec<ShotLine> = lines
         .iter()
@@ -843,6 +1088,221 @@ fn ocr_languages() -> Vec<String> {
     ocr::available_languages()
 }
 
+// ---------------------------------------------------------------------------
+// 语言方向（会话内手选）
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+fn supported_languages() -> Vec<engine::online::LangOption> {
+    engine::online::supported_languages()
+}
+
+/// 设置本会话的手选方向。任一侧传 `null` = 那一侧交回自动。
+///
+/// 前端改完方向要**先 await 这个命令再触发重译**：两个 invoke 之间没有顺序保证，
+/// 抢跑的话第一次重译还是按旧方向走，用户会看到"选了没用、再点一下才对"。
+#[tauri::command]
+fn set_manual_direction(
+    state: State<AppState>,
+    src: Option<String>,
+    tgt: Option<String>,
+) -> Result<ManualDir, String> {
+    for (which, v) in [("源", &src), ("目标", &tgt)] {
+        if let Some(name) = v {
+            if !engine::online::is_supported(name) {
+                return Err(format!("不支持的{which}语言「{name}」"));
+            }
+        }
+    }
+    let next = ManualDir { src, tgt };
+    *state.manual_dir.lock().map_err(|e| e.to_string())? = next.clone();
+    Ok(next)
+}
+
+#[tauri::command]
+fn get_manual_direction(state: State<AppState>) -> ManualDir {
+    state
+        .manual_dir
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------------
+// 全局热键
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+fn hotkey_list() -> Vec<hotkey::HotkeyInfo> {
+    hotkey::global().snapshot()
+}
+
+/// 改一个全局热键。
+///
+/// # 次序：**先注册新的，成功了再注销旧的**
+/// 反过来（先注销后注册）在新组合被别的程序占着时会把用户搞成"两个键都没了"。
+/// 现在的次序保证失败时旧键**原样还在生效**，用户最多是换不成，不会丢功能。
+///
+/// # ⚠ 全程不能持有 `HotkeyState` 的锁
+/// 插件的 `register/unregister` 内部是"把活儿丢给主线程并阻塞等结果"，而主线程可能正在
+/// 跑热键 handler。若我们持着自己的锁去等主线程、handler 又要拿这把锁 ⇒ ABBA 死锁。
+/// 所以下面每个 `hotkey::global()` 调用都是"进去拿了就出来"，中间不夹插件调用。
+/// 详见 `hotkey.rs` 模块头。
+#[tauri::command]
+fn hotkey_set(app: AppHandle, action: String, accel: String) -> hotkey::HotkeySetResult {
+    use tauri_plugin_global_shortcut::GlobalShortcutExt;
+
+    let fail = |msg: String| hotkey::HotkeySetResult {
+        ok: false,
+        message: msg,
+        hotkeys: hotkey::global().snapshot(),
+    };
+
+    let Some(act) = hotkey::Action::from_key(&action) else {
+        return fail(format!("未知的动作「{action}」"));
+    };
+    let (canon, sc) = match hotkey::parse_accel(&accel) {
+        Ok(v) => v,
+        Err(e) => return fail(e),
+    };
+
+    let st = hotkey::global();
+    // 撞上另一个动作正占着的组合：先拦下来。让它走到 register 会撞**自己**的
+    // AlreadyRegistered，错误信息是"已被注册"，用户完全看不出是被译点自己占了。
+    if let Some(other) = st.taken_by_other(act, &sc) {
+        return fail(format!(
+            "这个组合已经用在「{}」上了，先把那个换掉",
+            other.label()
+        ));
+    }
+
+    let old = st.active(act);
+    if old == Some(sc) {
+        // 已经就是它：不做任何 OS 操作（重复 register 会撞自己的 AlreadyRegistered）。
+        // 但仍把规范串落盘一次，好把历史上写歪的大小写顺手纠正过来。
+        persist_hotkey(&app, act, &canon);
+        st.record(act, canon, Some(sc), String::new());
+        return hotkey::HotkeySetResult {
+            ok: true,
+            message: String::new(),
+            hotkeys: st.snapshot(),
+        };
+    }
+
+    let gs = app.global_shortcut();
+    if let Err(e) = gs.register(sc) {
+        diag_log(&app, &format!("hotkey_set: 注册 {canon} 失败: {e}"));
+        return fail(format!(
+            "「{}」注册不上（多半被别的程序占着）：{e}",
+            crate::format_accel_zh(&canon)
+        ));
+    }
+    if let Some(o) = old {
+        // 失败只记录不回滚：新键已经生效，回滚反而会把用户刚设好的键也撤掉。
+        // 残留的旧键顶多是多一个能触发的组合，下次启动就没了。
+        if let Err(e) = gs.unregister(o) {
+            diag_log(
+                &app,
+                &format!("hotkey_set: 旧键 {} 注销失败(已忽略): {e}", o.into_string()),
+            );
+        }
+    }
+    persist_hotkey(&app, act, &canon);
+    st.record(act, canon.clone(), Some(sc), String::new());
+    diag_log(&app, &format!("hotkey_set: {} → {canon} 已生效", act.key()));
+    hotkey::HotkeySetResult {
+        ok: true,
+        message: String::new(),
+        hotkeys: st.snapshot(),
+    }
+}
+
+fn persist_hotkey(app: &AppHandle, act: hotkey::Action, accel: &str) {
+    let st = app.state::<AppState>();
+    // 不写成 `if let Ok(g) = ...` 收尾：那样它是函数的尾表达式，MutexGuard 这个临时量会
+    // 排在局部变量 `st` **之后**析构，借用检查直接不过（E0597）。
+    let conn = match st.db.lock() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let _ = db::set_setting(&conn, act.setting_key(), accel);
+}
+
+/// 「测一下」：开一个探测窗口，接下来这几秒内按这个热键**只回报、不执行**。
+///
+/// 这是唯一能查出"低级键盘钩子把键吞了"的办法 —— 那类程序（微信/QQ 截图、Snipaste、
+/// 输入法、AHK）不占 RegisterHotKey 的槽位，我们这边 register 照样返回成功、
+/// `is_registered` 也照样是 true，只有真按一次才知道到底到没到。
+#[tauri::command]
+fn hotkey_probe(app: AppHandle, action: String) -> Result<u64, String> {
+    let act = hotkey::Action::from_key(&action).ok_or_else(|| format!("未知的动作「{action}」"))?;
+    hotkey::global().arm_probe(act);
+    diag_log(&app, &format!("hotkey_probe: 开始探测 {}", act.key()));
+    Ok(hotkey::PROBE_WINDOW_MS)
+}
+
+/// 撤掉探测窗口（用户测到一半跑去改键 / 关掉设置页）。
+///
+/// 不撤的话，那个窗口内**第一次**按该热键会被吞成"探测命中"——只回报、不执行动作，
+/// 而前端此时已经不在等待态、回报被丢弃 ⇒ 界面完全没反应，用户会得出"这个键也被占了"
+/// 的相反结论。改键那条路已经在 `HotkeyState::record` 里顺手清了，这个命令补的是
+/// 「按 Esc 取消录制」「切走设置页」这两条不经过 record 的路。
+#[tauri::command]
+fn hotkey_probe_cancel(action: String) {
+    if let Some(act) = hotkey::Action::from_key(&action) {
+        hotkey::global().disarm_probe(act);
+    }
+}
+
+/// 侧栏「截图翻译」按钮：走和热键完全相同的通路。
+///
+/// 点按钮时译点自己在前台，不先让开的话截到的就是译点的窗口。**最小化**而不是隐藏：
+/// 任务栏里还留着入口，用户不会找不回来。
+#[tauri::command]
+async fn trigger_shot(app: AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        if w.is_visible().unwrap_or(false) {
+            let _ = w.minimize();
+            // 等窗口真的从屏幕上消失再抓图，否则抓到的还是带着译点的那一帧。
+            tokio::time::sleep(std::time::Duration::from_millis(260)).await;
+        }
+    }
+    diag_log(&app, "trigger_shot: 来自侧栏按钮");
+    start_screenshot(app).await;
+}
+
+#[tauri::command]
+fn app_version(app: AppHandle) -> String {
+    app.package_info().version.to_string()
+}
+
+/// 规范串 → 人读写法（`alt+KeyQ` → `Alt + Q`）。只用于给用户看的错误文案。
+///
+/// 前端 `hotkey.ts` 的 `formatAccel` 才是显示层的正主，这里只做**够读**的粗略还原：
+/// 后端错误信息里出现一串 `shift+control+KeyQ` 太劝退。两边不需要逐字一致。
+fn format_accel_zh(accel: &str) -> String {
+    let mut parts: Vec<&str> = accel.split('+').collect();
+    let main = parts.pop().unwrap_or("");
+    let mut out: Vec<String> = Vec::new();
+    for (tok, label) in [
+        ("control", "Ctrl"),
+        ("shift", "Shift"),
+        ("alt", "Alt"),
+        ("super", "Win"),
+    ] {
+        if parts.contains(&tok) {
+            out.push(label.to_string());
+        }
+    }
+    out.push(
+        main.strip_prefix("Key")
+            .or_else(|| main.strip_prefix("Digit"))
+            .unwrap_or(main)
+            .to_string(),
+    );
+    out.join(" + ")
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let mut builder = tauri::Builder::default();
@@ -869,24 +1329,43 @@ pub fn run() {
 
     #[cfg(desktop)]
     {
-        use tauri_plugin_global_shortcut::{Code, Modifiers, Shortcut, ShortcutState};
+        use tauri_plugin_global_shortcut::ShortcutState;
         builder = builder.plugin(
             tauri_plugin_global_shortcut::Builder::new()
+                // ⚠⚠ 这个闭包是插件**持着它自己那把 Mutex、在主线程 WndProc 里**调进来的。
+                //    因此这里只许做两件事：判断、spawn。具体禁忌（会硬死锁）：
+                //      · 绝不能调任何 GlobalShortcut 方法（register/unregister/is_registered）；
+                //      · 绝不能做任何阻塞或耗时的事（主线程卡住＝整个界面假死）。
+                //    判断用的是 hotkey::global() 里的原子量，一把锁都不拿，详见 hotkey.rs 模块头。
                 .with_handler(|app, shortcut, event| {
                     // 一次按键会派发 Pressed+Released 两个事件，只认 Pressed
                     if event.state() != ShortcutState::Pressed {
                         return;
                     }
-                    let alt_q = Shortcut::new(Some(Modifiers::ALT), Code::KeyQ);
-                    let alt_w = Shortcut::new(Some(Modifiers::ALT), Code::KeyW);
-                    if *shortcut == alt_q {
-                        diag_log(app, "hotkey: Alt+Q pressed");
-                        let app = app.clone();
-                        tauri::async_runtime::spawn(async move { start_screenshot(app).await });
-                    } else if *shortcut == alt_w {
-                        diag_log(app, "hotkey: Alt+W pressed");
-                        let app = app.clone();
-                        tauri::async_runtime::spawn(async move { start_selection(app).await });
+                    let Some(action) = hotkey::global().action_of(shortcut.id()) else {
+                        return; // 不是我们的键（理论上到不了这儿），静默忽略
+                    };
+                    // 「测一下」：只回报按到了，不执行真实动作（否则一测就截图/划词）。
+                    if hotkey::global().take_probe(action) {
+                        let _ = app.emit("yidian://hotkey-probe", action.key());
+                        diag_log(
+                            app,
+                            &format!("hotkey: {} 探测命中（未执行动作）", action.key()),
+                        );
+                        return;
+                    }
+                    diag_log(
+                        app,
+                        &format!("hotkey: {} pressed ({})", action.key(), shortcut.into_string()),
+                    );
+                    let app = app.clone();
+                    match action {
+                        hotkey::Action::Shot => {
+                            tauri::async_runtime::spawn(async move { start_screenshot(app).await });
+                        }
+                        hotkey::Action::Selection => {
+                            tauri::async_runtime::spawn(async move { start_selection(app).await });
+                        }
                     }
                 })
                 .build(),
@@ -917,6 +1396,9 @@ pub fn run() {
                 popup_payload: Mutex::new(None),
                 shot_payload: Mutex::new(None),
                 paddle: Mutex::new(None),
+                manual_dir: Mutex::new(ManualDir::default()),
+            req_seq: std::sync::atomic::AtomicU64::new(0),
+            latest_req: Mutex::new((String::new(), 0)),
             });
             // 托盘常驻图标 + 右键菜单
             #[cfg(desktop)]
@@ -962,22 +1444,69 @@ pub fn run() {
                     }
                 }
             }
+            // 版本/构建标记：跨机排查时第一件要确认的就是"那台机器跑的到底是哪个包"。
+            // 此前日志里完全没有版本信息，为此白白绕过弯路（2026-08-06 补）。
+            diag_log(
+                app.handle(),
+                &format!(
+                    "=== 启动 版本={} 构建标记=v0.4.0-2026-08-07(方向可选+热键可自定义) exe={:?}",
+                    app.package_info().version,
+                    std::env::current_exe().ok()
+                ),
+            );
             #[cfg(desktop)]
             {
-                use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut};
+                use tauri_plugin_global_shortcut::GlobalShortcutExt;
                 let gs = app.global_shortcut();
-                let aq = Shortcut::new(Some(Modifiers::ALT), Code::KeyQ);
-                let aw = Shortcut::new(Some(Modifiers::ALT), Code::KeyW);
-                let rq = gs.register(aq);
-                let rw = gs.register(aw);
+                let st = hotkey::global();
+                // 已经被本程序占下的组合。⚠ 必须有这一步：`hotkey_set` 那边有 taken_by_other
+                // 拦自冲突，开机这条路却是直接照 DB 注册 —— 而 DB 里**可以**存下两个相同的组合
+                // （给 A 设某组合时，若 B 那串当时正好没注册成功，taken_by_other 就不会拦）。
+                // 撞上时第二个动作会收到 ERROR_HOTKEY_ALREADY_REGISTERED，文案却把锅甩给
+                // "别的程序占着"，用户照着这个提示怎么换都换不好（2026-08-07 对抗复核揪出）。
+                let mut claimed: Vec<(hotkey::Action, tauri_plugin_global_shortcut::Shortcut)> =
+                    Vec::new();
+                for act in hotkey::Action::ALL {
+                    let stored = read_setting_val(app.handle(), act.setting_key());
+                    let (accel, sc, warn) = hotkey::parse_or_default(act, stored.as_deref());
+                    if let Some(w) = &warn {
+                        diag_log(app.handle(), &format!("startup hotkey {}: {w}", act.key()));
+                    }
+                    // ⚠ 必须把**失败原因**也记下来，不能只记 ok=false：热键被别的程序占住时
+                    // （RegisterHotKey 独占），原因就藏在这个 Err 里，否则跨机排查只能靠猜。
+                    let (active, err) = match claimed.iter().find(|(_, s)| *s == sc) {
+                        Some((other, _)) => (
+                            None,
+                            format!("和「{}」设成了同一个组合，去设置里把其中一个换掉", other.label()),
+                        ),
+                        None => match gs.register(sc) {
+                            Ok(()) => {
+                                claimed.push((act, sc));
+                                (Some(sc), String::new())
+                            }
+                            Err(e) => (None, format!("{e}")),
+                        },
+                    };
+                    st.record(act, accel.clone(), active, err.clone());
+                    diag_log(
+                        app.handle(),
+                        &format!(
+                            "startup register: {} = {accel} → {}",
+                            act.key(),
+                            if err.is_empty() {
+                                "ok".to_string()
+                            } else {
+                                format!("失败: {err}")
+                            }
+                        ),
+                    );
+                }
+                // 划词等键的主键 VK 是"发 Ctrl+C 之前等谁松开"的依据，单独记一行便于判读日志。
                 diag_log(
                     app.handle(),
                     &format!(
-                        "startup register: Alt+Q ok={:?} is_registered={:?}; Alt+W ok={:?} is_registered={:?}",
-                        rq.is_ok(),
-                        gs.is_registered(aq),
-                        rw.is_ok(),
-                        gs.is_registered(aw),
+                        "startup register: 划词等键主键 vk={:#04x}",
+                        st.selection_main_vk()
                     ),
                 );
             }
@@ -1023,7 +1552,233 @@ pub fn run() {
             close_shot,
             edit_in_main,
             ocr_languages,
+            supported_languages,
+            set_manual_direction,
+            get_manual_direction,
+            hotkey_list,
+            hotkey_set,
+            hotkey_probe,
+            hotkey_probe_cancel,
+            trigger_shot,
+            app_version,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+// ---------------------------------------------------------------------------
+// 方向解析的单测
+//
+// `resolve_direction` 是"自动规则 / 用户手选 / 母语配置"三者汇合的唯一漏斗，
+// 它错一点，主界面、划词、截图三条路会一起错。这里用内存库把它整条钉住。
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod direction_tests {
+    use super::*;
+
+    fn state(native: &str, native_to: &str) -> AppState {
+        let conn = Connection::open_in_memory().unwrap();
+        db::init_schema(&conn).unwrap();
+        db::seed_default_settings(&conn).unwrap();
+        // 直接写库、绕过 settings_set 的校验：既是为了方便，也是为了能造出"脏数据"场景。
+        db::set_setting(&conn, "native_lang", native).unwrap();
+        db::set_setting(&conn, "native_to", native_to).unwrap();
+        AppState {
+            db: Mutex::new(conn),
+            dicts: Mutex::new(dict::DictCache::new()),
+            screenshot: Mutex::new(None),
+            popup_payload: Mutex::new(None),
+            shot_payload: Mutex::new(None),
+            paddle: Mutex::new(None),
+            manual_dir: Mutex::new(ManualDir::default()),
+            req_seq: std::sync::atomic::AtomicU64::new(0),
+            latest_req: Mutex::new((String::new(), 0)),
+        }
+    }
+
+    fn set_manual(st: &AppState, src: Option<&str>, tgt: Option<&str>) {
+        *st.manual_dir.lock().unwrap() = ManualDir {
+            src: src.map(String::from),
+            tgt: tgt.map(String::from),
+        };
+    }
+
+    fn d(st: &AppState, text: &str) -> (String, String, bool) {
+        let r = resolve_direction(st, text, true);
+        (r.src, r.tgt, r.src_manual)
+    }
+
+    #[test]
+    fn auto_follows_the_native_rule() {
+        let st = state("Chinese", "English");
+        assert_eq!(d(&st, "hello"), ("English".into(), "Chinese".into(), false));
+        assert_eq!(d(&st, "你好"), ("Chinese".into(), "English".into(), false));
+        assert_eq!(
+            d(&st, "こんにちは"),
+            ("Japanese".into(), "Chinese".into(), false)
+        );
+    }
+
+    #[test]
+    fn native_pair_is_configurable() {
+        // 学日语的人：中文 → 日文，其他外语仍然回中文
+        let st = state("Chinese", "Japanese");
+        assert_eq!(d(&st, "你好"), ("Chinese".into(), "Japanese".into(), false));
+        assert_eq!(d(&st, "hello"), ("English".into(), "Chinese".into(), false));
+
+        // 母语本身是日语的人
+        let st = state("Japanese", "English");
+        assert_eq!(
+            d(&st, "こんにちは"),
+            ("Japanese".into(), "English".into(), false)
+        );
+        assert_eq!(d(&st, "你好"), ("Chinese".into(), "Japanese".into(), false));
+    }
+
+    #[test]
+    fn manual_target_wins_over_the_rule() {
+        let st = state("Chinese", "English");
+        set_manual(&st, None, Some("Japanese"));
+        // 源仍交给引擎自动识别（src_manual=false），只有目标被钉住
+        assert_eq!(d(&st, "hello"), ("English".into(), "Japanese".into(), false));
+        assert_eq!(d(&st, "你好"), ("Chinese".into(), "Japanese".into(), false));
+    }
+
+    /// 用户手选源语言的**头号用途**：`東京` 这类只含汉字的日语，脚本层原理上判不出来
+    /// （见 lang.rs 已知盲区），只能靠手选。此时 src_manual 必须是 true —— 它决定了
+    /// 在线引擎收到的是 `sl=ja` 还是 `sl=auto`，而 auto 会把它当中文原样返回。
+    #[test]
+    fn manual_source_overrides_the_blind_spot() {
+        let st = state("Chinese", "English");
+        assert_eq!(
+            d(&st, "東京"),
+            ("Chinese".into(), "English".into(), false),
+            "前提：自动判定确实会把它当中文"
+        );
+        set_manual(&st, Some("Japanese"), None);
+        assert_eq!(d(&st, "東京"), ("Japanese".into(), "Chinese".into(), true));
+    }
+
+    /// 只钉源语言时，目标要按**钉住的那个源**现算，不能沿用按自动判定算出来的目标。
+    /// 反例：文本是英文（自动 → English→Chinese），用户把源钉成 Chinese，
+    /// 目标若沿用 auto_tgt 就还是 Chinese ⇒ 中译中。
+    #[test]
+    fn manual_source_recomputes_the_target() {
+        let st = state("Chinese", "English");
+        set_manual(&st, Some("Chinese"), None);
+        assert_eq!(d(&st, "hello"), ("Chinese".into(), "English".into(), true));
+    }
+
+    /// **不能拿一个猜出来的源去顶掉用户明选的目标**（2026-08-07 对抗复核揪出）。
+    ///
+    /// 现场：目标选中文 + 翻 `東京都新宿区`（只含汉字的日语，脚本层必判成中文）。
+    /// 旧逻辑：src==tgt 触发同语言保护 → 目标被悄悄改成英文 → 引擎自己识别出日语、译成英文。
+    /// 用户明明选了"译成中文"，拿到英文，界面上还显示着中文。
+    /// 关键在于：src_manual=false 时 src 只是我们的猜测，而且**根本不会发给引擎**（走 sl=auto），
+    /// 它没有资格否决用户的显式选择。
+    #[test]
+    fn a_guessed_source_never_overrides_the_explicitly_chosen_target() {
+        let st = state("Chinese", "English");
+        set_manual(&st, None, Some("Chinese"));
+        let r = d(&st, "東京都新宿区");
+        assert_eq!(r.1, "Chinese", "用户明选的目标不能被改写");
+        assert!(!r.2, "源仍是自动 ⇒ 交给引擎识别（它能认出这是日语）");
+
+        // 混排也一样：`hello 世界` 判中文，用户选目标=中文时不许被顶成英文
+        set_manual(&st, None, Some("Chinese"));
+        assert_eq!(d(&st, "hello 世界").1, "Chinese");
+    }
+
+    /// 反过来：源是**用户手选**的（可信、且真会发给引擎）时，同语言保护仍要生效，
+    /// 否则会拿 zh→zh 去打引擎，原样返回。
+    #[test]
+    fn same_language_protection_still_applies_when_source_is_trusted() {
+        let st = state("Chinese", "English");
+        set_manual(&st, Some("Chinese"), Some("Chinese"));
+        let r = d(&st, "你好");
+        assert_eq!(r.0, "Chinese");
+        assert_eq!(r.1, "English", "两边都是用户选的且相同 ⇒ 按规则改目标");
+    }
+
+    #[test]
+    fn same_language_is_never_produced() {
+        let st = state("Chinese", "English");
+        set_manual(&st, Some("Chinese"), Some("Chinese"));
+        let r = d(&st, "你好");
+        assert_eq!(r.0, "Chinese");
+        assert_ne!(r.1, r.0, "src==tgt 会让引擎原样返回，等于没翻");
+        assert_eq!(r.1, "English");
+
+        // 病态配置：母语和"母语译成"设成同一个，也不能产出同语言
+        let st = state("Chinese", "Chinese");
+        set_manual(&st, Some("Chinese"), None);
+        let r = d(&st, "你好");
+        assert_ne!(r.1, r.0);
+    }
+
+    #[test]
+    fn selection_can_ignore_manual_direction() {
+        let st = state("Chinese", "English");
+        set_manual(&st, Some("Japanese"), Some("Korean"));
+        // follow_manual=false ⇒ 划词/截图完全按自动规则走（默认行为）
+        let r = resolve_direction(&st, "hello", false);
+        assert_eq!((r.src.as_str(), r.tgt.as_str(), r.src_manual), ("English", "Chinese", false));
+        // follow_manual=true ⇒ 继承主窗手选
+        let r = resolve_direction(&st, "hello", true);
+        assert_eq!((r.src.as_str(), r.tgt.as_str(), r.src_manual), ("Japanese", "Korean", true));
+    }
+
+    /// 库里被塞进不认识的语言名（旧版本残留/手改）时必须回落，而不是把这个名字一路带到
+    /// 引擎——Google 收到无效 tl 会返回 200 且**原样不翻译**，用户只会觉得软件坏了。
+    #[test]
+    fn broken_native_settings_fall_back_instead_of_reaching_the_engine() {
+        let st = state("Klingon", "Elvish");
+        assert_eq!(d(&st, "hello"), ("English".into(), "Chinese".into(), false));
+        assert_eq!(d(&st, "你好"), ("Chinese".into(), "English".into(), false));
+    }
+
+    /// 「同一段文字换方向重译」时，走得慢的那次**不许**把历史行盖回旧方向。
+    ///
+    /// 前端的 reqId 只能取消显示、取消不了已发出的后端请求；而历史按 source_text UPSERT，
+    /// 谁最后落库谁赢。旧请求撞上 token 过期+本地兜底要十秒量级，新请求走热 token 三百毫秒，
+    /// 顺序反过来完全正常。（2026-08-07 对抗复核揪出）
+    #[test]
+    fn a_late_landing_stale_request_must_not_overwrite_history() {
+        let st = state("Chinese", "English");
+        // 同一段原文连发两次（模拟改方向后重译）
+        let old = claim_request(&st, "hello");
+        let new = claim_request(&st, "hello");
+        assert!(is_superseded(&st, "hello", old), "旧的那次必须被判过期");
+        assert!(!is_superseded(&st, "hello", new), "最新那次照常落库");
+
+        // ⚠ 判据必须按**原文**比对：打字防抖期间各次原文不同，它们写的是不同的历史行，
+        // 谁也不该压谁。用全局代次的话，前一个字的那次会被后一个字的那次误判成过期。
+        let a = claim_request(&st, "hel");
+        let b = claim_request(&st, "hell");
+        assert!(!is_superseded(&st, "hel", a), "不同原文不该互相压");
+        assert!(!is_superseded(&st, "hell", b));
+    }
+
+    /// 方向解析产出的两侧语言，必须都能在引擎语言表里查到码。
+    /// 这条把"方向解析"和"引擎调用"两个模块的契约钉在一起。
+    #[test]
+    fn resolved_directions_are_always_translatable() {
+        let st = state("Chinese", "English");
+        for t in [
+            "hello", "你好", "こんにちは", "안녕하세요", "Привет", "สวัสดี", "مرحبا", "123",
+            "Γειά", "שלום", "नमस्ते",
+        ] {
+            let r = resolve_direction(&st, t, true);
+            assert!(
+                engine::online::is_supported(&r.src),
+                "「{t}」判出的源语言 {} 不在语言表里",
+                r.src
+            );
+            assert!(
+                engine::online::is_supported(&r.tgt),
+                "「{t}」判出的目标语言 {} 不在语言表里",
+                r.tgt
+            );
+        }
+    }
 }

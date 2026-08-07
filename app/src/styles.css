@@ -100,6 +100,11 @@ body, .sidebar, .surface, .input, .out, .card, .row, .setrow, .dictrow {
 }
 .nav {
   display: flex; align-items: center; gap: 9px;
+  /* 侧栏只有 158px，行内可用宽度 118px。底部两行要额外挂一个热键徽章（"Alt + Q" 就 42px，
+     三修饰键组合能到 100px），不允许换行的话 flex 只能去压标签和图标 —— 实测出厂默认键
+     就已经把「截图翻译」折成两行，换成 Ctrl+Shift+Alt+Q 时图标被压到 0px 直接消失、
+     徽章还溢出按钮。让徽章自己换行，标签和图标就都保住了。(2026-08-07 实测) */
+  flex-wrap: wrap; row-gap: 3px;
   padding: 8px 10px; border-radius: 8px;
   color: var(--sub); font-size: 13px; cursor: pointer;
   border: none; background: none; width: 100%; text-align: left;
@@ -113,7 +118,10 @@ body, .sidebar, .surface, .input, .out, .card, .row, .setrow, .dictrow {
 .nav .tag {
   margin-left: auto; font-size: 10px; border: 1px solid var(--line-strong);
   color: var(--faint); border-radius: 5px; padding: 0 5px;
+  white-space: nowrap; flex-shrink: 0;
 }
+/* 热键没注册上：徽章直接说话，不能让用户对着一个按下去没反应的组合发呆 */
+.nav .tag.warn { color: var(--danger); border-color: var(--danger); }
 .spacer { flex: 1; }
 
 /* ---------------- 主区通用 ---------------- */
@@ -141,8 +149,27 @@ body, .sidebar, .surface, .input, .out, .card, .row, .setrow, .dictrow {
 .lang .swap {
   color: var(--accent); font-weight: 700; cursor: pointer; padding: 0 2px;
   border: none; background: none; font-size: 14px; font-family: inherit;
+  border-radius: 6px;
 }
+.lang .swap:not(:disabled):hover { background: var(--surface); }
+.lang .swap:disabled { color: var(--faint); cursor: default; }
 .lang .auto { color: var(--sub); font-size: 11px; }
+
+/* 语言下拉：长得像一段可点的文字，不要系统原生控件那圈边框 */
+.langsel {
+  border: none; background: none; font-family: inherit; font-size: 13px; font-weight: 500;
+  color: var(--ink); cursor: pointer; padding: 2px 4px; border-radius: 6px;
+  max-width: 150px; outline: none;
+}
+.langsel:hover { background: var(--surface); }
+.langsel:focus-visible { box-shadow: 0 0 0 2px var(--accent); }
+/* 下拉弹层由系统绘制，深色主题下必须显式给底色，否则是白底白字 */
+.langsel option { background: var(--surface); color: var(--ink); }
+/* 设置页里的语言下拉：独立控件，给回边框 */
+.langsel.wide {
+  background: var(--surface-2); padding: 7px 10px; border-radius: 8px; max-width: 180px;
+}
+.langsel.wide:hover { background: var(--line); }
 
 .seg {
   display: flex; background: var(--surface-2); border-radius: 9px; padding: 2px; font-size: 12px;
@@ -307,6 +334,34 @@ body, .sidebar, .surface, .input, .out, .card, .row, .setrow, .dictrow {
   background: var(--ink); color: var(--bg); font-size: 13px; padding: 9px 16px;
   border-radius: 10px; box-shadow: var(--shadow-md); z-index: 50; opacity: .96;
 }
+
+/* ---------------- 说明卡（模态） ---------------- */
+.modal-mask {
+  position: fixed; inset: 0; z-index: 60;
+  background: rgba(0, 0, 0, .35);
+  display: flex; align-items: center; justify-content: center; padding: 24px;
+}
+.modal {
+  background: var(--surface); border-radius: var(--radius-lg); box-shadow: var(--shadow-md);
+  max-width: 420px; width: 100%; padding: 20px 22px;
+  display: flex; flex-direction: column; gap: 12px;
+}
+.modal-title { font-size: 16px; font-weight: 700; }
+.modal-body { display: flex; flex-direction: column; gap: 8px; font-size: 13.5px; line-height: 1.65; }
+.modal-body .dim { color: var(--sub); font-size: 12.5px; }
+.modal-body .danger { color: var(--danger); font-size: 12.5px; }
+.modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px; }
+
+/* 行内按键写法，如「Alt + W」 */
+.kbd {
+  display: inline-block; margin: 0 4px; padding: 1px 7px;
+  background: var(--surface-2); border: 1px solid var(--line-strong); border-radius: 6px;
+  font-size: 12.5px; font-weight: 600; white-space: nowrap;
+}
+
+/* 视觉禁用（.btn 本身没有 disabled 样式） */
+.btn:disabled { opacity: .45; cursor: default; }
+.btn:disabled:hover { background: var(--surface-2); }
 
 ::-webkit-scrollbar { width: 10px; height: 10px; }
 ::-webkit-scrollbar-thumb { background: var(--line-strong); border-radius: 6px; border: 2px solid var(--bg); }

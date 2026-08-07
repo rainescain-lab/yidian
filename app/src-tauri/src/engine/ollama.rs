@@ -1,4 +1,4 @@
-use super::{lang, prompt};
+use super::prompt;
 use serde::Deserialize;
 use std::time::Duration;
 
@@ -29,19 +29,24 @@ pub fn parse_chat_content(json: &str) -> Result<String, String> {
     Ok(r.message.content)
 }
 
-/// 调本地 Ollama /api/chat 翻译一段文本，返回清洗后的译文。
-pub async fn translate_local(text: &str) -> Result<String, String> {
-    translate_local_with(text, OLLAMA_CHAT_URL, DEFAULT_TIMEOUT).await
+/// 调本地 Ollama /api/chat 把一段文本从 `src` 译成 `tgt`，返回清洗后的译文。
+///
+/// ⚠ **方向必须由调用方给，本函数不再自己判**（2026-08-07 修）。原先这里自己又调了一次
+/// `lang::default_direction(text)`，于是「用户手选的方向」只对在线路径生效、本地路径我行我素。
+/// 这个半截 bug 只在**切到本地引擎**或**在线失败触发本地兜底**时才现形，极难发现。
+pub async fn translate_local(text: &str, src: &str, tgt: &str) -> Result<String, String> {
+    translate_local_with(text, src, tgt, OLLAMA_CHAT_URL, DEFAULT_TIMEOUT).await
 }
 
 /// 端点与超时可注入的版本，便于测试「服务不回数据时会超时返回而不是永久挂起」。
 /// localhost 必须直连、绝不走系统/Clash 代理（`.no_proxy()`）。
 pub async fn translate_local_with(
     text: &str,
+    src: &str,
+    tgt: &str,
     url: &str,
     timeout: Duration,
 ) -> Result<String, String> {
-    let (src, tgt) = lang::default_direction(text);
     let body = serde_json::json!({
         "model": "qwen2.5:7b-instruct",
         "stream": false,
@@ -117,7 +122,7 @@ mod tests {
         let url = format!("http://{addr}/api/chat");
         let rt = tokio::runtime::Runtime::new().unwrap();
         let t0 = std::time::Instant::now();
-        let r = rt.block_on(translate_local_with("hello", &url, Duration::from_millis(800)));
+        let r = rt.block_on(translate_local_with("hello", "English", "Chinese", &url, Duration::from_millis(800)));
         let elapsed = t0.elapsed();
 
         let err = r.expect_err("服务不回数据时应当超时报错，而不是返回成功");
@@ -142,7 +147,7 @@ mod tests {
         };
         let url = format!("http://127.0.0.1:{port}/api/chat");
         let t0 = std::time::Instant::now();
-        let r = rt.block_on(translate_local_with("hello", &url, Duration::from_secs(30)));
+        let r = rt.block_on(translate_local_with("hello", "English", "Chinese", &url, Duration::from_secs(30)));
         assert!(r.is_err(), "无人监听时应当报错");
         assert!(
             t0.elapsed() < Duration::from_secs(5),
@@ -156,7 +161,7 @@ mod tests {
     #[ignore]
     fn translate_local_real_smoke() {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let out = rt.block_on(translate_local("hello")).expect("翻译应成功");
+        let out = rt.block_on(translate_local("hello", "English", "Chinese")).expect("翻译应成功");
         println!("REAL OUTPUT for 'hello' => {out}");
         assert!(!out.is_empty(), "译文不应为空");
         assert!(

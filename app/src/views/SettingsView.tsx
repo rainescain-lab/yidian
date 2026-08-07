@@ -1,9 +1,17 @@
-import type { ThemeMode } from "../types";
+import type { HotkeyInfo, LangOption, ThemeMode } from "../types";
+import { hotkeyProbe, hotkeyProbeCancel } from "../api";
+import HotkeyInput from "../components/HotkeyInput";
 
 interface Props {
   settings: Record<string, string>;
   onChange: (key: string, value: string) => void;
   onNavigate: (view: string) => void;
+  langs: LangOption[];
+  hotkeys: HotkeyInfo[];
+  /** 真相源是后端返回的快照，所以改键要走这条而不是 onChange。 */
+  onCommitHotkey: (action: string, accel: string) => Promise<{ ok: boolean; message?: string }>;
+  probeHit: { action: string; nonce: number } | null;
+  version: string;
 }
 
 function Seg<T extends string>({
@@ -26,11 +34,55 @@ function Seg<T extends string>({
   );
 }
 
-export default function SettingsView({ settings, onChange, onNavigate }: Props) {
+function LangSelect({
+  value,
+  langs,
+  onPick,
+}: {
+  value: string;
+  langs: LangOption[];
+  onPick: (v: string) => void;
+}) {
+  return (
+    <select className="langsel wide" value={value} onChange={(e) => onPick(e.target.value)}>
+      {/* langs 还没拉回来时至少保住当前值，否则 select 会显示成空白 */}
+      {langs.length === 0 && <option value={value}>{value}</option>}
+      {langs.map((l) => (
+        <option key={l.name} value={l.name}>
+          {l.label}
+        </option>
+      ))}
+    </select>
+  );
+}
+
+export default function SettingsView({
+  settings,
+  onChange,
+  onNavigate,
+  langs,
+  hotkeys,
+  onCommitHotkey,
+  probeHit,
+  version,
+}: Props) {
   const theme = (settings.theme as ThemeMode) || "system";
-  const engine = settings.default_engine || "local";
+  const engine = settings.default_engine || "online";
   const order = settings.online_order || "bing,google";
   const ocr = settings.ocr_engine || "fast";
+  const nativeLang = settings.native_lang || "Chinese";
+  const nativeTo = settings.native_to || "English";
+  const followManual = settings.selection_follow_manual === "1";
+
+  const shot = hotkeys.find((h) => h.action === "shot");
+  const selection = hotkeys.find((h) => h.action === "selection");
+  const hitFor = (a: string) => (probeHit && probeHit.action === a ? probeHit.nonce : undefined);
+
+  const nativeLabel = langs.find((l) => l.name === nativeLang)?.label ?? nativeLang;
+  const nativeToLabel = langs.find((l) => l.name === nativeTo)?.label ?? nativeTo;
+  // 母语只能从"译点真能判出来的语言"里选（后端 native_ok）。法语/德语/西语这些在字符层面
+  // 与英语一样，选成母语会让母语原文被判成外语、"译回母语"＝原地不动且看不出错。
+  const nativeLangs = langs.filter((l) => l.native_ok);
 
   return (
     <>
@@ -55,6 +107,54 @@ export default function SettingsView({ settings, onChange, onNavigate }: Props) 
                 { v: "system", label: "跟随系统" },
               ]}
             />
+          </div>
+        </div>
+
+        <div className="group">
+          <div className="group-title">翻译方向</div>
+          <div className="setrow">
+            <div>
+              <div className="label">我的母语</div>
+              <div className="desc">
+                看不懂的东西一律译成它。当前规则：{nativeLabel} → {nativeToLabel}，其他任何语言 →{" "}
+                {nativeLabel}
+              </div>
+              <div className="desc" style={{ fontSize: 11, color: "var(--faint)" }}>
+                只列出译点能认出原文的语言。法语/德语/西语等在字符层面与英语无异，认不出来，
+                但可以选作下面的「母语译成」
+              </div>
+            </div>
+            <LangSelect
+              value={nativeLang}
+              langs={nativeLangs}
+              onPick={(v) => onChange("native_lang", v)}
+            />
+          </div>
+          <div className="setrow">
+            <div>
+              <div className="label">母语译成</div>
+              <div className="desc">
+                输入的是母语时译成哪种语言。学日语就把它改成日语，中文会直接译成日文
+              </div>
+            </div>
+            <LangSelect value={nativeTo} langs={langs} onPick={(v) => onChange("native_to", v)} />
+          </div>
+          <div className="setrow">
+            <div>
+              <div className="label">划词 / 截图跟随主界面手选</div>
+              <div className="desc">
+                关（推荐）：划词截图永远按上面这条规则走。开：跟着主界面顶上那两个下拉框 ——
+                手选是一次性的意图，忘了改回来会让划词一直译到奇怪的语言去
+              </div>
+            </div>
+            <label className="switch">
+              <input
+                type="checkbox"
+                checked={followManual}
+                onChange={(e) => onChange("selection_follow_manual", e.target.checked ? "1" : "0")}
+              />
+              <span className="slider" />
+            </label>
           </div>
         </div>
 
@@ -106,13 +206,26 @@ export default function SettingsView({ settings, onChange, onNavigate }: Props) 
               ]}
             />
           </div>
-          <div className="setrow">
-            <div>
-              <div className="label">快捷键</div>
-              <div className="desc">Alt + Q 截图翻译 · Alt + W 划词翻译（全局，任意程序里可用）</div>
-            </div>
-            <span style={{ color: "var(--faint)", fontSize: 12 }}>全局热键</span>
-          </div>
+          {/* ⚠ HotkeyInput 的根节点**就是**一行 .setrow，外面不要再包 div，
+              否则 `.setrow + .setrow` 那套「相邻行去边框 + 首尾圆角」的规则会断。 */}
+          <HotkeyInput
+            label="截图翻译"
+            value={shot?.accel ?? settings.hotkey_shot}
+            ok={shot?.ok ?? false}
+            onCommit={(a) => onCommitHotkey("shot", a)}
+            onProbe={() => hotkeyProbe("shot")}
+            onProbeCancel={() => void hotkeyProbeCancel("shot")}
+            probeHit={hitFor("shot")}
+          />
+          <HotkeyInput
+            label="划词翻译"
+            value={selection?.accel ?? settings.hotkey_selection}
+            ok={selection?.ok ?? false}
+            onCommit={(a) => onCommitHotkey("selection", a)}
+            onProbe={() => hotkeyProbe("selection")}
+            onProbeCancel={() => void hotkeyProbeCancel("selection")}
+            probeHit={hitFor("selection")}
+          />
         </div>
 
         <div className="group">
@@ -133,7 +246,9 @@ export default function SettingsView({ settings, onChange, onNavigate }: Props) 
               <div className="label">译点 YiDian</div>
               <div className="desc">桌面翻译器 · 本地优先 · 数据只存本机</div>
             </div>
-            <span style={{ color: "var(--faint)", fontSize: 12 }}>v0.2</span>
+            <span style={{ color: "var(--faint)", fontSize: 12 }}>
+              {version ? `v${version}` : ""}
+            </span>
           </div>
         </div>
       </div>

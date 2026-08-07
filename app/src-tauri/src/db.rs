@@ -81,7 +81,21 @@ pub fn seed_default_settings(conn: &Connection) -> Result<()> {
         ("theme", "system"),          // light | dark | system
         ("default_engine", "online"), // local | online（在线更快，卡时自动回退本地）
         ("online_order", "bing,google"),
-        ("ocr_engine", "fast"),       // fast(Windows WinRT) | accurate(qwen3-vl)
+        ("ocr_engine", "fast"), // fast(Windows WinRT) | accurate(qwen3-vl)
+        // —— 翻译方向（2026-08-07）。规则＝「母语→native_to；其他任何语言→母语」——
+        // 用两个参数表达用户那条「中文→英文，其他→中文」，顺带让学日语的人能把 native_to 改成
+        // Japanese。⚠ 值域一律用后端已有的**英文语言名**，不要用 zh/en 语言码，否则会在
+        // 前端、DB、引擎三处引入第二套命名。
+        ("native_lang", "Chinese"),
+        ("native_to", "English"),
+        // 划词/截图是否继承主窗里手选的方向。默认否：手选是**任务级**意图（"我这会儿要把这段
+        // 译成日文"），不是偏好；而划词走全局热键、离 UI 最远，最容易被残留状态咬。
+        ("selection_follow_manual", "0"),
+        // —— 全局热键（2026-08-07 起可自定义）。格式＝插件 Shortcut::into_string() 的规范串：
+        // 修饰符小写、顺序固定 shift+control+alt+super，主键用 W3C KeyboardEvent.code。
+        // ⚠ 这里只是"用户想要的值"；**真相源是实际注册成功的那个**（见 lib.rs 的 HotkeyState）。
+        ("hotkey_shot", "alt+KeyQ"),
+        ("hotkey_selection", "alt+KeyW"),
     ];
     for (k, v) in defaults {
         conn.execute(
