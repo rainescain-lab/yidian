@@ -11,7 +11,7 @@ html, body, #shot-root {
   display: flex;
   flex-direction: column;
   align-items: flex-start; /* 图按原宽左对齐，不被拉伸到窗口宽 */
-  cursor: pointer;
+  cursor: default; /* 已废弃「点空白关」，光标不再暗示整块可点 */
   background: transparent;
 }
 
@@ -43,6 +43,31 @@ html, body, #shot-root {
   overflow-wrap: break-word; /* 只有超过 max-width(图右缘)时才断，长英文单词也能断；不逐字断 */
   word-break: normal;
   font-family: "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+}
+
+/* 关闭按钮：图右上角，明确可点。取代原来看不见边界的「点空白关」。 */
+.closex {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  z-index: 10;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  color: #f4f7ff;
+  background: rgba(16, 42, 82, 0.92);
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.22);
+}
+.closex:hover {
+  background: #c0392b;
 }
 
 /* 底部工具条：图下方独立条带，不遮挡文字 */

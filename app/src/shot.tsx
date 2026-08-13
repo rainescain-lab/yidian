@@ -29,17 +29,14 @@ function Shot() {
     invoke<Payload | null>("take_shot_payload")
       .then((v) => setP(v))
       .catch(() => {});
-    const close = () => invoke("close_shot");
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") close();
+      if (e.key === "Escape") invoke("close_shot");
     };
-    // 关闭只由：点空白(onClick) / Esc / 30s 超时。不用 blur——全局触发时窗口未必获焦。
+    // 关闭只由：右上角 ✕ / Esc。**不设自动消失**——用户明确要求「不需要关的时候它应该一直存在」。
+    // 已废弃「点空白关」：空白区的边界不可见，底部工具条又吃掉点击，用户会点到不关的地方而以为卡死。
+    // 不用 blur——全局触发时窗口未必获焦。
     window.addEventListener("keydown", onKey);
-    const t = window.setTimeout(close, 30000);
-    return () => {
-      window.removeEventListener("keydown", onKey);
-      window.clearTimeout(t);
-    };
+    return () => window.removeEventListener("keydown", onKey);
   }, []);
 
   if (!p) return <div className="shot" />;
@@ -61,15 +58,14 @@ function Shot() {
     .filter(Boolean)
     .join("\n");
 
-  function copy(e: React.MouseEvent) {
-    e.stopPropagation();
+  function copy() {
     navigator.clipboard.writeText(joinedDst);
     setCopied(true);
     setTimeout(() => setCopied(false), 1000);
   }
 
   return (
-    <div className="shot" onClick={() => invoke("close_shot")}>
+    <div className="shot">
       <div className="imgwrap" style={{ width: `${p.disp_w}px` }}>
         <img src={p.image} alt="" />
         {p.lines.map((l, i) =>
@@ -94,8 +90,11 @@ function Shot() {
             </div>
           ) : null,
         )}
+        <button className="closex" onClick={() => invoke("close_shot")} title="关闭（Esc）">
+          ✕
+        </button>
       </div>
-      <div className="bar" onClick={(e) => e.stopPropagation()}>
+      <div className="bar">
         <button
           className="b primary"
           onClick={() => invoke("edit_in_main", { text: joinedSrc })}
@@ -106,7 +105,7 @@ function Shot() {
         <button className="b" onClick={copy}>
           {copied ? "已复制" : "复制"}
         </button>
-        <span className="tip">点空白 / Esc 关</span>
+        <span className="tip">✕ 或 Esc 关 · 不点就一直在</span>
       </div>
     </div>
   );
