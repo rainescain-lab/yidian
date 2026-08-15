@@ -917,7 +917,20 @@ async fn paddle_ocr(app: &AppHandle, b64: String) -> Result<Vec<ocr::LineBox>, S
         let mut guard = st.paddle.lock().map_err(|e| e.to_string())?;
         if guard.is_none() {
             let exe = resolve_paddle_exe(&app2).ok_or("未找到 PaddleOCR-json.exe")?;
-            *guard = Some(ocr::paddle::Paddle::start(&exe)?);
+            let t0 = std::time::Instant::now();
+            let p = ocr::paddle::Paddle::start(&exe)?;
+            let pid = p.pid();
+            // 作业对象没挂上属于"保护降级"，必须留痕，别让它悄悄发生
+            let note = p.job_note().map(|s| s.to_string());
+            *guard = Some(p);
+            diag_log(
+                &app2,
+                &format!(
+                    "paddle 冷启动 pid={pid} 用时 {}ms（启动不再预热，故首次会多等模型冷载）{}",
+                    t0.elapsed().as_millis(),
+                    note.map(|s| format!(" {s}")).unwrap_or_default()
+                ),
+            );
         }
         guard.as_mut().unwrap().ocr_base64(&b64)
     })
@@ -925,16 +938,41 @@ async fn paddle_ocr(app: &AppHandle, b64: String) -> Result<Vec<ocr::LineBox>, S
     .map_err(|e| format!("PaddleOCR 线程错误: {e}"))?
 }
 
-/// 启动时预热 PaddleOCR：跑一次空图，既验证子进程 I/O 通、又预载模型（消首次冷载延迟）。
-async fn warmup_paddle(app: AppHandle) {
-    let png = capture::blank_png(40, 40);
-    let b64 = B64.encode(&png);
-    match paddle_ocr(&app, b64).await {
-        Ok(lines) => diag_log(
-            &app,
-            &format!("paddle warmup OK: {} lines (subprocess ready)", lines.len()),
-        ),
-        Err(e) => diag_log(&app, &format!("paddle warmup FAILED: {e}")),
+/// 空闲多久就把 PaddleOCR 子进程整个退掉。
+///
+/// 不是抠门：实测子进程**每做一次真实识别就涨一大截且不释放**（一张 1920×1080、25 行 →
+/// 从 635 MB 涨到 2314 MB 提交内存）。这是 PaddleOCR-json 自身的毛病、我们改不了它的源码，
+/// 调用方唯一能做的就是别让它常驻。退掉后下次用会重新懒启动，代价是 2~3s 模型冷载。
+const PADDLE_IDLE_MAX_SECS: u64 = 180;
+const PADDLE_IDLE_CHECK_SECS: u64 = 30;
+
+/// 空闲看门狗：定期看 PaddleOCR 子进程多久没用了，超时就退掉释放内存。
+async fn paddle_idle_watchdog(app: AppHandle) {
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(PADDLE_IDLE_CHECK_SECS)).await;
+        // ⚠ 取出来之后要在**锁外** drop：drop 会 kill + wait 子进程，可能阻塞，
+        //    不能占着 AppState 的锁做，否则并发的识别请求全被堵住。
+        let taken = {
+            let st = app.state::<AppState>();
+            // ⚠ 用 try_lock 不用 lock：锁被占着＝正有识别在跑＝本来就不算空闲，
+            //   而且这是 async 任务，用阻塞的 lock() 会把 tokio 工作线程堵到识别结束。
+            let mut g = match st.paddle.try_lock() {
+                Ok(g) => g,
+                Err(_) => continue, // 正忙 或 锁中毒：下一轮再看，别在看门狗里 panic
+            };
+            match g.as_ref().map(|p| p.idle_secs()) {
+                Some(idle) if idle >= PADDLE_IDLE_MAX_SECS => g.take(),
+                _ => None,
+            }
+        };
+        if let Some(p) = taken {
+            let (pid, idle) = (p.pid(), p.idle_secs());
+            drop(p); // 这一下才真正 kill + wait + 关作业对象
+            diag_log(
+                &app,
+                &format!("paddle 空闲 {idle}s，已退出子进程 pid={pid} 释放内存（下次用会重新懒启动）"),
+            );
+        }
     }
 }
 
@@ -1444,13 +1482,20 @@ pub fn run() {
                     }
                 }
             }
-            // 版本/构建标记：跨机排查时第一件要确认的就是"那台机器跑的到底是哪个包"。
+            // 版本/构建类型/exe 路径：跨机排查时第一件要确认的就是"那台机器跑的到底是哪个包"。
             // 此前日志里完全没有版本信息，为此白白绕过弯路（2026-08-06 补）。
+            //
+            // ⚠ 这里只记**自动取得、不可能说谎**的东西。原先还手写了一个
+            //   `构建标记=v0.4.0-2026-08-07(...)`，发 0.4.1 时忘了同步，日志就成了
+            //   「版本=0.4.1 构建标记=v0.4.0-…」自相矛盾 —— 偏偏这行就是给跨机排查用的。
+            //   凡是要人手同步的版本字符串迟早会陈旧，索性删掉：
+            //   "这一版有什么"该写在 Release 说明里，不该写在会过期的字面量里。
             diag_log(
                 app.handle(),
                 &format!(
-                    "=== 启动 版本={} 构建标记=v0.4.0-2026-08-07(方向可选+热键可自定义) exe={:?}",
+                    "=== 启动 版本={} 构建={} exe={:?}",
                     app.package_info().version,
+                    if cfg!(debug_assertions) { "debug" } else { "release" },
                     std::env::current_exe().ok()
                 ),
             );
@@ -1514,10 +1559,32 @@ pub fn run() {
                 app.handle(),
                 &format!("ocr languages available: {:?}", ocr::available_languages()),
             );
-            // 后台预热 PaddleOCR（验证子进程 + 预载模型，不阻塞启动）
+            // PaddleOCR 子进程：**不再启动预热**。
+            //
+            // 预热原本是为了消掉首次截图翻译的 2~3s 模型冷载，但代价是这个子进程从开机起就
+            // 常驻——实测它光启动就占 600 MB 提交内存，做过一次真实全屏识别后涨到 2.3 GB 且不还。
+            // 划词翻译根本用不到它。所以改成**用到才起**（见 paddle_ocr 的懒启动），
+            // 代价是首次截图多等 2~3 秒，日志里会记。
+            //
+            // 这里只做两件跟"别再泄漏"有关的事：清理旧版漏下的孤儿 + 挂空闲看门狗。
             {
                 let h = app.handle().clone();
-                tauri::async_runtime::spawn(async move { warmup_paddle(h).await });
+                if let Some(exe) = resolve_paddle_exe(&h) {
+                    let killed = ocr::paddle::kill_orphans(&exe);
+                    if !killed.is_empty() {
+                        diag_log(
+                            &h,
+                            &format!(
+                                "已清理上次残留的 PaddleOCR 孤儿进程 {:?}（旧版从不 kill 子进程，每启动一次漏一个）",
+                                killed
+                            ),
+                        );
+                    }
+                }
+            }
+            {
+                let h = app.handle().clone();
+                tauri::async_runtime::spawn(async move { paddle_idle_watchdog(h).await });
             }
             // 后台预热在线翻译（预抓 Bing token + 暖连接，首次截图翻译即热，消除首次慢）
             {

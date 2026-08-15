@@ -57,6 +57,12 @@ features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_System_DataExchange",
     "Win32_System_SystemInformation",
+    # PaddleOCR 子进程生命周期：作业对象(父死则子亡) + 枚举并清理旧版漏下的孤儿
+    # ⚠ Win32_Security 是必需的：CreateJobObjectW 带 SECURITY_ATTRIBUTES 参数，
+    #   windows-rs 用 #[cfg(feature = "Win32_Security")] 门控它，缺了就只报"函数不存在"
+    "Win32_System_JobObjects",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_Security",
 ]
 
 [dev-dependencies]
