@@ -910,7 +910,17 @@ fn resolve_paddle_exe(app: &AppHandle) -> Option<std::path::PathBuf> {
 }
 
 /// PaddleOCR 识别（懒启动持久子进程；阻塞 I/O 放 spawn_blocking）。
-async fn paddle_ocr(app: &AppHandle, b64: String) -> Result<Vec<ocr::LineBox>, String> {
+///
+/// 一次收下**整张图切好的所有瓦片**，理由有两条：
+/// ① 子进程的锁只取一次 —— 逐块各取一次会被空闲看门狗和并发请求插进来；
+/// ② 坐标换算集中在一处 —— 每块识别完要把坐标先按自己的放大倍数缩回去、再加上该块
+///    在原图中的偏移，散在调用方极易漏掉一半。
+///
+/// 单块失败不拖垮整张：记下错误继续下一块，只有**全军覆没**才向上报错。
+async fn paddle_ocr_tiles(
+    app: &AppHandle,
+    tiles: Vec<(Vec<u8>, i32, i32, u32)>,
+) -> Result<Vec<ocr::LineBox>, String> {
     let app2 = app.clone();
     tauri::async_runtime::spawn_blocking(move || -> Result<Vec<ocr::LineBox>, String> {
         let st = app2.state::<AppState>();
@@ -932,7 +942,33 @@ async fn paddle_ocr(app: &AppHandle, b64: String) -> Result<Vec<ocr::LineBox>, S
                 ),
             );
         }
-        guard.as_mut().unwrap().ocr_base64(&b64)
+        let p = guard.as_mut().unwrap();
+        let mut out: Vec<ocr::LineBox> = Vec::new();
+        let mut errs: Vec<String> = Vec::new();
+        for (png, off_x, off_y, factor) in tiles {
+            let b64 = B64.encode(&png);
+            match p.ocr_base64(&b64) {
+                Ok(mut lines) => {
+                    let f = factor.max(1) as f64;
+                    for l in &mut lines {
+                        l.x = l.x / f + off_x as f64;
+                        l.y = l.y / f + off_y as f64;
+                        l.w /= f;
+                        l.h /= f;
+                    }
+                    out.append(&mut lines);
+                }
+                Err(e) => errs.push(e),
+            }
+        }
+        if out.is_empty() {
+            if let Some(e) = errs.into_iter().next() {
+                return Err(e);
+            }
+        } else if !errs.is_empty() {
+            diag_log(&app2, &format!("⚠ 有 {} 块识别失败(已跳过): {:?}", errs.len(), errs));
+        }
+        Ok(out)
     })
     .await
     .map_err(|e| format!("PaddleOCR 线程错误: {e}"))?
@@ -1006,26 +1042,65 @@ async fn overlay_capture(app: AppHandle, x: f64, y: f64, w: f64, h: f64) -> Resu
         info.y + capture::dpi_scale(y + h, info.scale) + 8,
     );
 
-    // 小图放大后再 OCR（提升模糊/小字/少字识别率），坐标按倍数缩回原图
-    let (ocr_png, up) = capture::upscale_for_ocr(&png);
-    let b64_ocr = B64.encode(&ocr_png);
-    let mut lines = match paddle_ocr(&app, b64_ocr).await {
+    // 送检前切块。**宽图必须切、不能靠放大**——旧代码把整张图放大后一次送检，而检测端
+    // 会把长边压回约 960px，于是放大纯属白算，还会漏掉大段文字（详见
+    // `capture::OCR_LONG_SIDE_BUDGET` 上那张实测表）。
+    let tiles = {
+        let png2 = png.clone();
+        tauri::async_runtime::spawn_blocking(move || capture::ocr_tiles(&png2))
+            .await
+            .map_err(|e| format!("切块线程错误: {e}"))?
+    };
+    let tile_n = tiles.len();
+    let tile_note = tiles
+        .iter()
+        .map(|(_, x, y, f)| format!("({x},{y})x{f}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut raw = match paddle_ocr_tiles(&app, tiles).await {
         Ok(l) => l,
         Err(e) => {
             show_popup(&app, "", &format!("识别失败：{e}"), "截图", popup_pos);
             return Ok(());
         }
     };
-    if up > 1 {
-        let f = up as f64;
-        for l in &mut lines {
-            l.x /= f;
-            l.y /= f;
-            l.w /= f;
-            l.h /= f;
+    // 每块四周补了背景边，贴着图边的字会被检测到那圈补边里，换算回原图就成了负坐标
+    // （实测 x=-6）。不夹回来的话译文块会挂在图的左边/上边之外。
+    {
+        let (fw, fh) = (crop_w as f64, crop_h as f64);
+        for l in &mut raw {
+            let (x1, y1) = ((l.x + l.w).min(fw), (l.y + l.h).min(fh));
+            l.x = l.x.clamp(0.0, fw);
+            l.y = l.y.clamp(0.0, fh);
+            l.w = (x1 - l.x).max(0.0);
+            l.h = (y1 - l.y).max(0.0);
         }
     }
-    diag_log(&app, &format!("overlay_capture: paddle {} lines (up {}x)", lines.len(), up));
+    let raw_n = raw.len();
+    // 版面后处理：先滤幻觉框，再把同一视觉行的碎框并回一行。
+    // 不做这一步的话，碎片各翻各的 ⇒ 屏幕上每块译文都只是半句话（用户报的「对照不上」）。
+    let (kept, dropped) = ocr::layout::drop_junk(raw);
+    let lines = ocr::layout::group_lines(kept);
+    // ⚠ **这段日志是刻意加的**：上一轮排查这个问题时，日志里只有"paddle N lines"一个数字，
+    //   框在哪、认成了什么、置信度多少全都没有，只能靠从用户的截图里反推像素才定位到根因。
+    //   别再删。
+    diag_log(
+        &app,
+        &format!(
+            "overlay_capture: 裁剪 {crop_w}x{crop_h} → 切 {tile_n} 块 [{tile_note}] → 原始 {raw_n} 框 → 滤掉 {} → 并成 {} 行",
+            dropped.len(),
+            lines.len()
+        ),
+    );
+    for d in &dropped {
+        diag_log(
+            &app,
+            &format!(
+                "  丢弃[{}] score={:.2} x={:.0} y={:.0} w={:.0} h={:.0} 「{}」",
+                d.reason, d.line.score, d.line.x, d.line.y, d.line.w, d.line.h, d.line.text
+            ),
+        );
+    }
     if lines.is_empty() {
         show_popup(&app, "", "（没认出文字，可框大点/选清楚点再试）", "截图", popup_pos);
         return Ok(());
@@ -1054,25 +1129,50 @@ async fn overlay_capture(app: AppHandle, x: f64, y: f64, w: f64, h: f64) -> Resu
         split.pop();
     }
     // 合并结果按行对齐（行数相符才用），否则留空待逐行补
+    let aligned = split.len() == lines.len();
     let mut dsts: Vec<String> = (0..lines.len())
-        .map(|i| if split.len() == lines.len() { split[i].clone() } else { String::new() })
+        .map(|i| if aligned { split[i].clone() } else { String::new() })
         .collect();
     // 补空：任何空译文单独重翻一次，保证每行都有译文、不漏翻
+    let mut refilled = 0usize;
     {
         let st = app.state::<AppState>();
         for (i, l) in lines.iter().enumerate() {
             if dsts[i].trim().is_empty() && !l.text.trim().is_empty() {
+                refilled += 1;
                 if let Ok(v) = run_translate(st.inner(), &l.text, engine, &dir).await {
                     dsts[i] = v.0;
                 }
             }
         }
     }
-    diag_log(&app, &format!(
-        "overlay_capture: filled {}/{} lines",
-        dsts.iter().filter(|s| !s.is_empty()).count(),
-        lines.len()
-    ));
+    // ⚠ 原来这里只打一句 `filled N/N`，而**合并对齐**和**逐行重翻**两条路都会打出同样的
+    //   N/N —— 排查时根本分不清走的哪条，只能靠耗时去猜。所以这里必须把路径写明白。
+    diag_log(
+        &app,
+        &format!(
+            "overlay_capture: 合并译文{}（{} 段 vs {} 行），逐行重翻 {refilled} 行，最终 {}/{} 行有译文",
+            if aligned { "按行对齐" } else { "行数对不上→整批改走逐行" },
+            split.len(),
+            lines.len(),
+            dsts.iter().filter(|s| !s.trim().is_empty()).count(),
+            lines.len()
+        ),
+    );
+    // 逐行留痕：框在哪 + 原文 + 译文。行多时只记前若干条，免得刷爆日志。
+    const LOG_LINES_MAX: usize = 25;
+    for (i, l) in lines.iter().take(LOG_LINES_MAX).enumerate() {
+        diag_log(
+            &app,
+            &format!(
+                "  行[{i}] x={:.0} y={:.0} w={:.0} h={:.0} s={:.2} 「{}」→「{}」",
+                l.x, l.y, l.w, l.h, l.score, l.text, dsts[i]
+            ),
+        );
+    }
+    if lines.len() > LOG_LINES_MAX {
+        diag_log(&app, &format!("  …另有 {} 行未记", lines.len() - LOG_LINES_MAX));
+    }
     {
         let st = app.state::<AppState>();
         record_history(st.inner(), &joined, &translated_all, &dir.src, &dir.tgt, "截图");

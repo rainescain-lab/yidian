@@ -443,6 +443,70 @@ mod tests {
         assert!(wait_gone(pid), "kill_orphans 返回了 pid={pid} 但它还活着");
     }
 
+    /// **真跑端到端复现回归**：一张宽截图条走完「切块 → 送检 → 版面后处理」，整句不许丢字。
+    ///
+    /// 这一条钉的就是 2026-08-15 那个「截图翻译对照不上」的根因：同一张 1327×49 的条，
+    /// 旧做法（整张放大到 2654 后一次送检）会把中间一整段 **静默漏掉**，屏幕上那段原文
+    /// 就没有任何译文块。切块之后必须一个词不少。
+    ///
+    /// 跑：
+    /// ```text
+    /// $env:YIDIAN_OCR_FIXTURE="<一张宽截图条.png>"
+    /// cargo test --lib -- --ignored --nocapture wide_strip
+    /// ```
+    #[test]
+    #[ignore = "要真起 PaddleOCR-json 子进程 + 一张宽截图 fixture(环境变量 YIDIAN_OCR_FIXTURE)"]
+    fn wide_strip_keeps_every_word() {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        let _g = serial();
+        let fixture = match std::env::var("YIDIAN_OCR_FIXTURE") {
+            Ok(p) => p,
+            Err(_) => {
+                println!("跳过：未设 YIDIAN_OCR_FIXTURE");
+                return;
+            }
+        };
+        let png = std::fs::read(&fixture).expect("读不到 fixture");
+        let exe = find_exe().expect("找不到 PaddleOCR-json.exe（可设 YIDIAN_PADDLE_EXE）");
+        let mut p = Paddle::start(&exe).expect("启动 PaddleOCR 失败");
+
+        let tiles = crate::capture::ocr_tiles(&png);
+        println!("切成 {} 块", tiles.len());
+        assert!(tiles.len() >= 2, "这么宽的条必须切块，实得 {} 块", tiles.len());
+
+        let mut all = Vec::new();
+        for (tile, ox, oy, f) in tiles {
+            let b64 = STANDARD.encode(&tile);
+            let mut lines = p.ocr_base64(&b64).expect("识别失败");
+            let fd = f.max(1) as f64;
+            for l in &mut lines {
+                l.x = l.x / fd + ox as f64;
+                l.y = l.y / fd + oy as f64;
+                l.w /= fd;
+                l.h /= fd;
+            }
+            all.append(&mut lines);
+        }
+        println!("原始 {} 框", all.len());
+        let (kept, dropped) = crate::ocr::layout::drop_junk(all);
+        for d in &dropped {
+            println!("  丢弃[{}] score={:.2} 「{}」", d.reason, d.line.score, d.line.text);
+        }
+        let lines = crate::ocr::layout::group_lines(kept);
+        for (i, l) in lines.iter().enumerate() {
+            println!("  行[{i}] x={:.0} y={:.0} w={:.0} s={:.2} 「{}」", l.x, l.y, l.w, l.score, l.text);
+        }
+        let text = lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join(" ");
+        println!("合并后：{text}");
+        // ⚠ 断言**对空格不敏感**。这条钉的是「整段文字被静默漏掉」，不是识别精度：
+        //   识别层对很长的一行会把字挤在一起、吞掉空格（`A file` → `Afile`），那是另一码事，
+        //   拿它当断言只会让这条回归测试变得脆弱、动不动就红。
+        let flat: String = text.chars().filter(|c| !c.is_whitespace()).collect::<String>().to_lowercase();
+        for w in ["3timesinarow", "afilebeingreador", "atooloutputis"] {
+            assert!(flat.contains(w), "丢了「{w}」—— 这正是旧做法的病症。实得：{text}");
+        }
+    }
+
     /// 路径不存在时不许乱杀，也不许 panic。
     #[test]
     fn kill_orphans_on_bogus_path_is_a_noop() {
@@ -484,6 +548,9 @@ fn parse(json: &str) -> Result<Vec<LineBox>, String> {
                 maxy = maxy.max(y);
             }
         }
+        // ⚠ `score` 缺失时按 1.0 算（＝不过滤），不能按 0：宁可放过幻觉，也不能因为
+        //   哪天上游改了字段名就把所有文字全滤光、截图翻译整个变成"没认出文字"。
+        let score = item.get("score").and_then(|s| s.as_f64()).unwrap_or(1.0);
         if maxx > minx && maxy > miny {
             out.push(LineBox {
                 text,
@@ -491,8 +558,49 @@ fn parse(json: &str) -> Result<Vec<LineBox>, String> {
                 y: miny,
                 w: maxx - minx,
                 h: maxy - miny,
+                score,
             });
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod parse_tests {
+    use super::*;
+
+    /// 真实响应样本（字段名与结构照抄 PaddleOCR-json v1.4.1 的输出）。
+    #[test]
+    fn parse_reads_box_and_score() {
+        let j = r#"{"code":100,"data":[
+            {"box":[[63,18],[102,18],[102,39],[63,39]],"score":0.86,"text":"Aut"},
+            {"box":[[608,21],[641,21],[641,30],[608,30]],"score":0.44,"text":"E"}
+        ]}"#;
+        let v = parse(j).unwrap();
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].text, "Aut");
+        assert_eq!((v[0].x, v[0].y, v[0].w, v[0].h), (63.0, 18.0, 39.0, 21.0));
+        assert!((v[0].score - 0.86).abs() < 1e-9);
+        assert!((v[1].score - 0.44).abs() < 1e-9, "低分也要如实带上来，交给版面层去滤");
+    }
+
+    /// 上游哪天不给 score 了也不能把文字全滤光 —— 缺失按 1.0（不过滤）算。
+    #[test]
+    fn parse_defaults_missing_score_to_one() {
+        let j = r#"{"code":100,"data":[{"box":[[0,0],[10,0],[10,5],[0,5]],"text":"hi"}]}"#;
+        let v = parse(j).unwrap();
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].score, 1.0);
+    }
+
+    #[test]
+    fn parse_no_text_is_empty_not_error() {
+        let v = parse(r#"{"code":101,"data":"No text found in image."}"#).unwrap();
+        assert!(v.is_empty());
+    }
+
+    #[test]
+    fn parse_error_code_is_an_error() {
+        assert!(parse(r#"{"code":200,"data":"boom"}"#).is_err());
+    }
 }

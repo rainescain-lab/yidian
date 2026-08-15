@@ -5,6 +5,7 @@
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 
+pub mod layout;
 pub mod paddle;
 
 /// 一行文字 + 它在图中的像素包围盒（用于图像内嵌翻译）。
@@ -15,6 +16,9 @@ pub struct LineBox {
     pub y: f64,
     pub w: f64,
     pub h: f64,
+    /// 识别置信度 0~1。**必须一路带到版面后处理**：低分的幻觉框会被翻译、被贴上屏，
+    /// 用户看到的就是凭空冒出来的两个字（见 [`layout::drop_junk`]）。
+    pub score: f64,
 }
 
 /// 带坐标的逐行识别（图像内嵌翻译用）。仅 Windows WinRT OCR 提供坐标；
@@ -224,6 +228,7 @@ mod winrt {
                     y: miny,
                     w: maxx - minx,
                     h: maxy - miny,
+                    score: 1.0, // WinRT OCR 不给行级置信度
                 });
             }
         }
