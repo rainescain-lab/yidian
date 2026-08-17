@@ -56,13 +56,21 @@ pub struct PopupPayload {
     engine: String,
 }
 
-/// 图像内嵌翻译结果：整块截图 + 每行原文/译文及其在图中的像素框。
+/// 图像内嵌翻译结果里的一块：**一段**原文/译文 + 它在图中的像素框。
+///
+/// ⚠ 单位是**段**不是行。一段话被换行切成 N 行后逐行各翻各的，贴回去就是半句半句
+/// 对不上（用户报的「对照不上」）；有道的图片翻译 API 也是按 region 给的，一个区域
+/// 一段原文一段译文。
 #[derive(Clone, serde::Serialize)]
 pub struct ShotLine {
+    /// 整段的外接框。译文按这个矩形重排。
     x: f64,
     y: f64,
     w: f64,
     h: f64,
+    /// 段内**逐行**的框 `[x, y, w, h]`。外接框在末行短的时候会圈进大片空白，
+    /// 要精确擦除原文得按行来，不能按外接框。
+    rects: Vec<[f64; 4]>,
     src: String,
     dst: String,
 }
@@ -182,6 +190,24 @@ fn read_native_pair(state: &AppState) -> (String, String) {
 /// `follow_manual = false` 时完全忽略主界面的手选（划词/截图默认走这条，见
 /// `selection_follow_manual` 设置项：划词离 UI 最远，最容易被残留的手选状态咬）。
 fn resolve_direction(state: &AppState, text: &str, follow_manual: bool) -> Direction {
+    resolve_direction_inner(state, text, follow_manual, false)
+}
+
+/// **截图整块文本专用**：脚本判定走抗噪口径。
+///
+/// 截图给出的是整屏几百个字符，OCR 会把图标误认成个别汉字；严格口径「命中即定级」会被
+/// 三个杂字带翻整批方向 ⇒ 英译英 ⇒ 一个字都没翻（2026-08-16 用户实测）。
+/// 划词那条路**不能**用这个口径，理由见 `lang::detect_script_lang_bulk` 的注释。
+fn resolve_direction_bulk(state: &AppState, text: &str, follow_manual: bool) -> Direction {
+    resolve_direction_inner(state, text, follow_manual, true)
+}
+
+fn resolve_direction_inner(
+    state: &AppState,
+    text: &str,
+    follow_manual: bool,
+    bulk: bool,
+) -> Direction {
     let (native, native_to) = read_native_pair(state);
     let manual = if follow_manual {
         state.manual_dir.lock().map(|g| g.clone()).unwrap_or_default()
@@ -189,7 +215,11 @@ fn resolve_direction(state: &AppState, text: &str, follow_manual: bool) -> Direc
         ManualDir::default()
     };
 
-    let (auto_src, auto_tgt) = engine::lang::direction_with_native(text, &native, &native_to);
+    let (auto_src, auto_tgt) = if bulk {
+        engine::lang::direction_with_native_bulk(text, &native, &native_to)
+    } else {
+        engine::lang::direction_with_native(text, &native, &native_to)
+    };
     let src_manual = manual.src.is_some();
     let src = manual.src.unwrap_or(auto_src);
     // 只钉了源语言时，目标仍按"母语→native_to，其他→母语"这条规则现算 ——
@@ -919,7 +949,7 @@ fn resolve_paddle_exe(app: &AppHandle) -> Option<std::path::PathBuf> {
 /// 单块失败不拖垮整张：记下错误继续下一块，只有**全军覆没**才向上报错。
 async fn paddle_ocr_tiles(
     app: &AppHandle,
-    tiles: Vec<(Vec<u8>, i32, i32, u32)>,
+    tiles: Vec<capture::OcrTile>,
 ) -> Result<Vec<ocr::LineBox>, String> {
     let app2 = app.clone();
     tauri::async_runtime::spawn_blocking(move || -> Result<Vec<ocr::LineBox>, String> {
@@ -945,16 +975,16 @@ async fn paddle_ocr_tiles(
         let p = guard.as_mut().unwrap();
         let mut out: Vec<ocr::LineBox> = Vec::new();
         let mut errs: Vec<String> = Vec::new();
-        for (png, off_x, off_y, factor) in tiles {
-            let b64 = B64.encode(&png);
+        for t in tiles {
+            let b64 = B64.encode(&t.png);
             match p.ocr_base64(&b64) {
                 Ok(mut lines) => {
-                    let f = factor.max(1) as f64;
+                    let s = if t.scale.is_finite() && t.scale > 0.0 { t.scale } else { 1.0 };
                     for l in &mut lines {
-                        l.x = l.x / f + off_x as f64;
-                        l.y = l.y / f + off_y as f64;
-                        l.w /= f;
-                        l.h /= f;
+                        l.x = l.x / s + t.off_x as f64;
+                        l.y = l.y / s + t.off_y as f64;
+                        l.w /= s;
+                        l.h /= s;
                     }
                     out.append(&mut lines);
                 }
@@ -1054,7 +1084,7 @@ async fn overlay_capture(app: AppHandle, x: f64, y: f64, w: f64, h: f64) -> Resu
     let tile_n = tiles.len();
     let tile_note = tiles
         .iter()
-        .map(|(_, x, y, f)| format!("({x},{y})x{f}"))
+        .map(|t| format!("({},{})x{:.2}", t.off_x, t.off_y, t.scale))
         .collect::<Vec<_>>()
         .join(" ");
     let mut raw = match paddle_ocr_tiles(&app, tiles).await {
@@ -1081,15 +1111,18 @@ async fn overlay_capture(app: AppHandle, x: f64, y: f64, w: f64, h: f64) -> Resu
     // 不做这一步的话，碎片各翻各的 ⇒ 屏幕上每块译文都只是半句话（用户报的「对照不上」）。
     let (kept, dropped) = ocr::layout::drop_junk(raw);
     let lines = ocr::layout::group_lines(kept);
+    let line_n = lines.len();
+    // 再把行并成**段**：翻译的单位必须是段，不是行。
+    let paras = ocr::layout::group_paragraphs(lines);
     // ⚠ **这段日志是刻意加的**：上一轮排查这个问题时，日志里只有"paddle N lines"一个数字，
     //   框在哪、认成了什么、置信度多少全都没有，只能靠从用户的截图里反推像素才定位到根因。
     //   别再删。
     diag_log(
         &app,
         &format!(
-            "overlay_capture: 裁剪 {crop_w}x{crop_h} → 切 {tile_n} 块 [{tile_note}] → 原始 {raw_n} 框 → 滤掉 {} → 并成 {} 行",
+            "overlay_capture: 裁剪 {crop_w}x{crop_h} → 切 {tile_n} 块 [{tile_note}] → 原始 {raw_n} 框 → 滤掉 {} → 并成 {line_n} 行 → 并成 {} 段",
             dropped.len(),
-            lines.len()
+            paras.len()
         ),
     );
     for d in &dropped {
@@ -1101,21 +1134,24 @@ async fn overlay_capture(app: AppHandle, x: f64, y: f64, w: f64, h: f64) -> Resu
             ),
         );
     }
-    if lines.is_empty() {
+    if paras.is_empty() {
         show_popup(&app, "", "（没认出文字，可框大点/选清楚点再试）", "截图", popup_pos);
         return Ok(());
     }
 
     // 翻译：截图默认走在线(快)，网络卡时 run_translate 内部自动回退本地 Qwen 兜底。
-    // 先合并翻一次按行拆回；凡是对不上/空的行再逐行单独重翻补齐（修「漏翻译」）。
-    let joined = lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join("\n");
+    // **一段一个翻译单位**：先合并翻一次按段拆回；对不上/空的段再单独重翻补齐。
+    let joined = paras.iter().map(|p| p.text.as_str()).collect::<Vec<_>>().join("\n");
     let engine = "online";
-    // 方向按**整块合并文本**算一次，后面补空的逐行重翻沿用同一个方向：
-    // 逐行各判各的会让同一张截图里的行译到不同语言去（英文行→中文、中文行→英文）。
+    // 方向按**整块合并文本**算一次，后面补空的逐段重翻沿用同一个方向：
+    // 逐段各判各的会让同一张截图里的段译到不同语言去（英文段→中文、中文段→英文）。
+    //
+    // ⚠ 这里必须用 **bulk**（抗噪）口径：截图是整屏几百个字符，OCR 会把图标误认成个别汉字，
+    //   严格口径「命中即定级」被三个杂字一带，整批就翻成中→英、英文译英文、一个字没翻。
     let follow = selection_follows_manual(&app);
     let dir = {
         let st = app.state::<AppState>();
-        resolve_direction(st.inner(), &joined, follow)
+        resolve_direction_bulk(st.inner(), &joined, follow)
     };
     let translated_all = {
         let st = app.state::<AppState>();
@@ -1128,64 +1164,67 @@ async fn overlay_capture(app: AppHandle, x: f64, y: f64, w: f64, h: f64) -> Resu
     while split.last().map(|s| s.is_empty()).unwrap_or(false) {
         split.pop();
     }
-    // 合并结果按行对齐（行数相符才用），否则留空待逐行补
-    let aligned = split.len() == lines.len();
-    let mut dsts: Vec<String> = (0..lines.len())
+    // 合并结果按段对齐（段数相符才用），否则留空待逐段补
+    let aligned = split.len() == paras.len();
+    let mut dsts: Vec<String> = (0..paras.len())
         .map(|i| if aligned { split[i].clone() } else { String::new() })
         .collect();
-    // 补空：任何空译文单独重翻一次，保证每行都有译文、不漏翻
+    // 补空：任何空译文单独重翻一次，保证每段都有译文、不漏翻
     let mut refilled = 0usize;
     {
         let st = app.state::<AppState>();
-        for (i, l) in lines.iter().enumerate() {
-            if dsts[i].trim().is_empty() && !l.text.trim().is_empty() {
+        for (i, p) in paras.iter().enumerate() {
+            if dsts[i].trim().is_empty() && !p.text.trim().is_empty() {
                 refilled += 1;
-                if let Ok(v) = run_translate(st.inner(), &l.text, engine, &dir).await {
+                if let Ok(v) = run_translate(st.inner(), &p.text, engine, &dir).await {
                     dsts[i] = v.0;
                 }
             }
         }
     }
-    // ⚠ 原来这里只打一句 `filled N/N`，而**合并对齐**和**逐行重翻**两条路都会打出同样的
+    // ⚠ 原来这里只打一句 `filled N/N`，而**合并对齐**和**逐条重翻**两条路都会打出同样的
     //   N/N —— 排查时根本分不清走的哪条，只能靠耗时去猜。所以这里必须把路径写明白。
     diag_log(
         &app,
         &format!(
-            "overlay_capture: 合并译文{}（{} 段 vs {} 行），逐行重翻 {refilled} 行，最终 {}/{} 行有译文",
-            if aligned { "按行对齐" } else { "行数对不上→整批改走逐行" },
+            "overlay_capture: 合并译文{}（{} 条 vs {} 段），逐段重翻 {refilled} 段，最终 {}/{} 段有译文，方向 {}→{}",
+            if aligned { "按段对齐" } else { "条数对不上→整批改走逐段" },
             split.len(),
-            lines.len(),
+            paras.len(),
             dsts.iter().filter(|s| !s.trim().is_empty()).count(),
-            lines.len()
+            paras.len(),
+            dir.src,
+            dir.tgt
         ),
     );
-    // 逐行留痕：框在哪 + 原文 + 译文。行多时只记前若干条，免得刷爆日志。
+    // 逐段留痕：框在哪 + 由几行并成 + 原文 + 译文。段多时只记前若干条，免得刷爆日志。
     const LOG_LINES_MAX: usize = 25;
-    for (i, l) in lines.iter().take(LOG_LINES_MAX).enumerate() {
+    for (i, p) in paras.iter().take(LOG_LINES_MAX).enumerate() {
         diag_log(
             &app,
             &format!(
-                "  行[{i}] x={:.0} y={:.0} w={:.0} h={:.0} s={:.2} 「{}」→「{}」",
-                l.x, l.y, l.w, l.h, l.score, l.text, dsts[i]
+                "  段[{i}] x={:.0} y={:.0} w={:.0} h={:.0} {}行 s={:.2} 「{}」→「{}」",
+                p.x, p.y, p.w, p.h, p.lines.len(), p.score, p.text, dsts[i]
             ),
         );
     }
-    if lines.len() > LOG_LINES_MAX {
-        diag_log(&app, &format!("  …另有 {} 行未记", lines.len() - LOG_LINES_MAX));
+    if paras.len() > LOG_LINES_MAX {
+        diag_log(&app, &format!("  …另有 {} 段未记", paras.len() - LOG_LINES_MAX));
     }
     {
         let st = app.state::<AppState>();
         record_history(st.inner(), &joined, &translated_all, &dir.src, &dir.tgt, "截图");
     }
-    let shot_lines: Vec<ShotLine> = lines
+    let shot_lines: Vec<ShotLine> = paras
         .iter()
         .enumerate()
-        .map(|(i, l)| ShotLine {
-            x: l.x,
-            y: l.y,
-            w: l.w,
-            h: l.h,
-            src: l.text.clone(),
+        .map(|(i, p)| ShotLine {
+            x: p.x,
+            y: p.y,
+            w: p.w,
+            h: p.h,
+            rects: p.lines.iter().map(|l| [l.x, l.y, l.w, l.h]).collect(),
+            src: p.text.clone(),
             dst: dsts.get(i).cloned().unwrap_or_default(),
         })
         .collect();

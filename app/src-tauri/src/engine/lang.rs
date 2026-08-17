@@ -148,6 +148,50 @@ pub fn detect_script_lang(s: &str) -> ScriptLang {
     ScriptLang::Unknown
 }
 
+/// **长文本**（截图 OCR 的整块结果）用的脚本判定：几个杂字不许翻转整体判定。
+///
+/// # 为什么要有两套
+///
+/// [`detect_script_lang`] 是「命中即定级」—— 见到一个汉字就归中文侧。**那条规则对划词是
+/// 对的**：选中的就几个字，按票数会让拉丁票压过汉字票（`hello 世界` 会被判成英文）。
+///
+/// 但截图完全是另一回事。2026-08-16 用户实测：截了一张 Excel 的数字格式菜单，14 行**全是
+/// 英文**，可 OCR 把日历图标认成了 `茴`/`芭`、货币图标认成 `￥` —— **3 个杂字**就让整批
+/// 被判成"中文侧"，方向变成中→英，于是英文译英文、**一个字都没翻**，而界面上还显示翻译成功。
+///
+/// 所以这里改成：CJK 只占极小比例、且文本够长时，把它们当噪声剔掉再判。
+/// 两条门槛缺一不可 —— 只看比例会让「三个字的中文标题」被当噪声。
+pub fn detect_script_lang_bulk(s: &str) -> ScriptLang {
+    /// 低于这个占比才可能是噪声。
+    const NOISE_RATIO: f64 = 0.10;
+    /// 文本至少要这么多个字母才谈得上"占比"。短文本一律走严格规则。
+    const MIN_LETTERS: usize = 40;
+
+    let mut cjk = 0usize;
+    let mut other = 0usize;
+    for c in s.chars() {
+        let u = c as u32;
+        if is_han(u) || is_kana(u) || is_hangul(u) {
+            cjk += 1;
+        } else if c.is_alphabetic() {
+            other += 1;
+        }
+    }
+    let total = cjk + other;
+    if cjk == 0 || total < MIN_LETTERS || (cjk as f64) >= NOISE_RATIO * total as f64 {
+        return detect_script_lang(s);
+    }
+    // 剔掉零星 CJK 再判。剩下的交给同一套规则，不另立门户。
+    let cleaned: String = s
+        .chars()
+        .filter(|c| {
+            let u = *c as u32;
+            !(is_han(u) || is_kana(u) || is_hangul(u))
+        })
+        .collect();
+    detect_script_lang(&cleaned)
+}
+
 /// 含汉字/假名（旧口径）。
 ///
 /// ⚠ **只留给测试断言用**（判"译文里有没有中文"）。**禁止拿它做方向判定** —— 它把
@@ -184,7 +228,16 @@ pub fn default_direction(text: &str) -> (&'static str, &'static str) {
 /// 返回 `String` 而非 `&'static str`：母语来自设置，不是编译期常量。
 /// 与 [`default_direction`] 的一致性由单测钉死（`native="Chinese", native_to="English"` 时两者必须同解）。
 pub fn direction_with_native(text: &str, native: &str, native_to: &str) -> (String, String) {
-    let src = detect_script_lang(text).name();
+    direction_from_script(detect_script_lang(text), native, native_to)
+}
+
+/// 同一条规则，但脚本判定走**抗噪**口径 —— 截图整块文本专用，见 [`detect_script_lang_bulk`]。
+pub fn direction_with_native_bulk(text: &str, native: &str, native_to: &str) -> (String, String) {
+    direction_from_script(detect_script_lang_bulk(text), native, native_to)
+}
+
+fn direction_from_script(script: ScriptLang, native: &str, native_to: &str) -> (String, String) {
+    let src = script.name();
     if src == native {
         (native.to_string(), native_to.to_string())
     } else {
@@ -326,6 +379,54 @@ mod tests {
             ("Chinese".into(), "Japanese".into()),
             "中文对日语母语者来说是外语，应译回日语"
         );
+    }
+
+    // ---- 抗噪口径（截图整块文本专用）----
+
+    /// **回归钉（2026-08-16 用户实测）**：截了一张 Excel 数字格式菜单，14 行全是英文，
+    /// 但 OCR 把日历/货币图标误认成了 `茴`/`芭`/`￥` 三个汉字。严格口径会把整批判成中文侧
+    /// ⇒ 英译英 ⇒ **一个字都没翻**，界面上还显示翻译成功。
+    #[test]
+    fn bulk_ignores_a_few_ocr_garbage_cjk_chars() {
+        let ocrd = "General 123Number Currency Accounting 芭 Short Date 茴LongDate Time \
+                    % Percentage Fraction 10nScientific AText CommaStyle ￥ Special Custom";
+        assert_eq!(
+            detect_script_lang(ocrd),
+            ScriptLang::Chinese,
+            "严格口径确实会被三个杂字带翻——这正是那个 bug"
+        );
+        assert_eq!(
+            detect_script_lang_bulk(ocrd),
+            ScriptLang::Latin,
+            "抗噪口径必须把它们当噪声剔掉"
+        );
+        assert_eq!(
+            direction_with_native_bulk(ocrd, "Chinese", "English"),
+            ("English".into(), "Chinese".into())
+        );
+    }
+
+    /// 真中文长文本不许被当成噪声剔掉。
+    #[test]
+    fn bulk_keeps_real_chinese() {
+        let s = "这是一段足够长的中文文本，用来验证抗噪口径不会把真正的中文内容当成噪声剔掉，\
+                 里面还夹杂了一些 English words 和数字 12345 混排。";
+        assert_eq!(detect_script_lang_bulk(s), ScriptLang::Chinese);
+    }
+
+    /// **短文本一律走严格口径**：三个字的中文标题不能因为"占比低"被当噪声。
+    #[test]
+    fn bulk_falls_back_to_strict_on_short_text() {
+        assert_eq!(detect_script_lang_bulk("hello 世界"), ScriptLang::Chinese);
+        assert_eq!(detect_script_lang_bulk("设置"), ScriptLang::Chinese);
+    }
+
+    /// 日语长文本照旧判日语（抗噪只剔"零星"CJK，不改语言优先级）。
+    #[test]
+    fn bulk_still_detects_japanese() {
+        let s = "これは日本語の長い文章です。スクリーンショット翻訳のテストのために書きました。\
+                 かなり長くしてあります。";
+        assert_eq!(detect_script_lang_bulk(s), ScriptLang::Japanese);
     }
 
     #[test]

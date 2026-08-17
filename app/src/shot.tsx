@@ -6,10 +6,13 @@ import "@fontsource/noto-sans-sc/500.css";
 import "./shot.css";
 
 interface Line {
+  /** 整段的外接框（可能跨多行）。 */
   x: number;
   y: number;
   w: number;
   h: number;
+  /** 段内逐行的框 [x,y,w,h]。用来算「这段原文一行有多高」——外接框的高是整段的。 */
+  rects?: number[][];
   src: string;
   dst: string;
 }
@@ -45,13 +48,14 @@ function Shot() {
   const H = p.height || 1;
   const dispScale = (p.disp_w || W) / W; // 显示像素 / 原图像素
   const dispH = p.disp_w * (H / W); // 图在窗口里的显示高
-  const shownH = p.lines
-    .filter((l) => l.dst)
-    .map((l) => l.h)
-    .sort((a, b) => a - b);
-  const medianH = shownH.length ? shownH[Math.floor(shownH.length / 2)] : 20;
-  // 全行统一字号（取框高中位数）→ 不再每行大小不一；按显示比例缩放并夹在可读区间
-  const fontPx = Math.max(13, Math.min(30, medianH * dispScale * 0.8));
+  // 一段可能跨多行，所以「原文一行有多高」要用段内行框去算，**不能拿段的外接框**
+  // —— 拿外接框的话，一段 4 行的标题会被当成 4 倍高的字，字号直接爆掉。
+  const lineHeightOf = (l: Line) =>
+    l.rects && l.rects.length ? l.h / l.rects.length : l.h;
+  // 字号**按每段自己的行高定**，不再全图统一：标题和正文本来就不一样大，
+  // 统一成一个中位数必然一半偏大一半偏小（这是「看着歪」的一个来源）。
+  const fontOf = (l: Line) =>
+    Math.max(13, Math.min(30, lineHeightOf(l) * dispScale * 0.8));
   const joinedSrc = p.lines.map((l) => l.src).join("\n");
   const joinedDst = p.lines
     .map((l) => l.dst)
@@ -83,7 +87,7 @@ function Shot() {
                   (p.disp_w * (W - l.x)) / W - 4,
                 )}px`,
                 minHeight: `${(l.h / H) * dispH}px`,
-                fontSize: `${fontPx}px`,
+                fontSize: `${fontOf(l)}px`,
               }}
             >
               {l.dst}

@@ -43,44 +43,55 @@ pub fn monitor_at(px: i32, py: i32) -> Result<MonitorInfo, String> {
 // 送检前的切块（图像内嵌翻译的成败全在这里）
 // ---------------------------------------------------------------------------
 
-/// PaddleOCR **检测端的长边预算**：超过大约这个像素数，它就把整张图等比缩回去，
-/// 多喂的像素一点用没有 —— 只会把字缩小到检测不出来。
+/// 送检图的**长边预算**，必须与启动 PaddleOCR 时传的 `-limit_side_len` 一致。
 ///
-/// **这个常量是实测出来的，不是查文档抄的**（2026-08-15，真 `PaddleOCR-json v1.4.1`
-/// + PP-OCRv3 det，素材＝一条真实截图里的英文）：
+/// # 这个数是怎么定下来的（别凭直觉改）
 ///
-/// | 喂进去的图 | 结果 |
-/// |---|---|
-/// | 434×49 原样 | 一个框读全整句 |
-/// | 664×49 原样 | 一个框读全整句 |
-/// | **1327×49 原样** | **中间整段「A file being read or」静默漏检** |
-/// | 2654×98（＝旧 `upscale_for_ocr` 放大 2 倍的做法） | **和不放大时一样地漏** |
-/// | 5308×196（放大 4 倍） | **依旧漏**，还多幻觉出两个字 |
-/// | 手工缩到 **960×35** | **和 1327 原样一样地漏** ← 就是这条钉死了内部缩放的存在 |
-/// | 切成三块各自送检 | **漏掉的那句当场读回来** |
+/// **检测端会把长边压到 `limit_side_len` 再做检测**，多喂的像素一点用没有、只会把字缩小。
+/// 2026-08-15 先由实测反推出这条规律（真 `PaddleOCR-json v1.4.1` + PP-OCRv3 det）：
+/// 同一段真实截图像素，`1327×49 原样` / `放大到 2654×98` / `放大到 5308×196` /
+/// `手工缩到 960×35` **四者结果完全一致地漏字**——只能解释为内部压到了同一个尺度。
+/// 次日在 `PaddleOCR-json.exe --help` 里坐实：`-limit_side_len default: 960`、
+/// `-limit_type default: "max"`。
 ///
-/// 后四行合在一起只能有一个解释：检测端把长边压到了同一个尺度，所以
-/// 「1327 原样 / 放大 2 倍 / 放大 4 倍 / 手工缩到 960」殊途同归。
+/// 关键是**它可以调**。调大之后同一张 1327×49 一次送检就读全了，而全屏 1920×1080 的
+/// 代价只从 760ms 涨到 1080ms（+42%）——和当初切块方案（1054ms）几乎一样，
+/// 却**没有切口、不会切掉字母、不用补边**。所以现在：预算调到 2048，切块降级成
+/// 「截图比预算还大」时才用的兜底。
 ///
-/// ⇒ **对宽图，放大是纯粹的无用功（还制造幻觉框），唯一有效的办法是切块。**
-/// 这也是当初「截图翻译段落散、大段漏译、冒出莫名其妙的两个字」的真正根因。
-pub const OCR_LONG_SIDE_BUDGET: u32 = 960;
+/// ⚠ 2048 而不是更大：det 的开销随面积涨，且 1920 宽的屏幕已被完整覆盖。
+pub const OCR_LONG_SIDE_BUDGET: u32 = 2048;
 
 /// 放大倍数上限。再高对识别没有额外收益，只是白烧 CPU 和内存。
-const OCR_MAX_UPSCALE: u32 = 3;
+const OCR_MAX_UPSCALE: f64 = 3.0;
+
+/// **送检前必须放大到用满预算，不能原样送。**
+///
+/// 除了「字大一点更好认」这个显然的理由，还有一条不显然的：PaddleOCR 把检测框排序成
+/// 阅读顺序时，判断「两个框是不是同一行」用的是**硬编码的 10 像素**
+/// （`tools/infer/predict_system.py` 的 `sorted_boxes`，3.x 的 PaddleX 照搬未改）。
+/// 而桌面 UI 的字只有 11px 上下、行距 13~17px，**紧贴这个阈值**——一旦行距落到 12px
+/// 以内，相邻两行就会被判成同一行再按 x 重排，直接导致上下行文字交错乱序。
+/// 放大到 1.5~3 倍后行距变成 20~50px，远离该阈值。
+fn ocr_scale_for(long_side: u32) -> f64 {
+    if long_side == 0 {
+        return 1.0;
+    }
+    (OCR_LONG_SIDE_BUDGET as f64 / long_side as f64).clamp(1.0, OCR_MAX_UPSCALE)
+}
 
 /// 切割点允许偏离等分位置的最大距离（像素）。给它一点自由度，是为了能**挑到字缝**上切。
 const CUT_SEARCH_RADIUS: u32 = 60;
 
-/// 一块要送去 OCR 的瓦片：它在原图里的位置 + 送检时的放大倍数。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// 一块要送去 OCR 的瓦片：它在原图里的位置 + 送检时的缩放倍数。
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Tile {
     pub x: u32,
     pub y: u32,
     pub w: u32,
     pub h: u32,
-    /// 送检前把这块放大几倍（坐标要按这个倍数缩回去）。
-    pub factor: u32,
+    /// 送检前把这块放大几倍（**可以是小数**，坐标要按它缩回去）。
+    pub scale: f64,
 }
 
 /// 把 `[0, len)` 切成若干段，**保证每段 ≤ budget**，并尽量把切口落在墨水最少的位置。
@@ -170,14 +181,16 @@ pub fn plan_cuts(len: u32, budget: u32, ink: &[u32]) -> Vec<(u32, u32)> {
 /// 代价是每块多占 2×PAD 像素的预算，所以 [`plan_tiles`] 切块时要先把这部分让出来。
 pub const TILE_PAD: u32 = 8;
 
-/// 给一张 w×h 的图排出送检瓦片：两个方向各自切到预算内，再给每块配放大倍数。
+/// 给一张 w×h 的图排出送检瓦片：先切到预算内（通常一块就够），再给每块配缩放倍数。
 ///
-/// 放大倍数的规则也变了：**只在放大后仍不超预算时才放大**。旧规则
-/// （`<700→3× / <1400→2× / else 1×`）只看图有多大、不看会不会被压回去，
-/// 于是 1327 宽的图被放大到 2654 —— 白算一遍，还平添幻觉框。
+/// 两条规则都变过，各自有实测依据：
+/// - **切块**：现在只在「截图本身比预算还大」时才发生。预算调到 2048 之后，绝大多数
+///   截图（含 1920 宽的整屏）都是**一整块送检**，没有切口、不会切掉字母。
+/// - **缩放**：不再是 `<700→3× / <1400→2×` 这种只看图多大的整数档，而是
+///   [`ocr_scale_for`] ——**缩放到正好用满预算**，因为送检图的长边就是检测端的工作尺度。
 ///
-/// 尺寸口径统一按**补边之后**算：切块预算先扣掉 `2×TILE_PAD`，倍数也按补边后的尺寸定，
-/// 这样「补完边、放大完，仍不超预算」是恒成立的。
+/// 尺寸口径统一按**补边之后**算：切块预算先扣掉 `2×TILE_PAD`，缩放也按补边后的尺寸定，
+/// 这样「补完边、缩放完，仍不超预算」恒成立。
 pub fn plan_tiles(w: u32, h: u32, ink_cols: &[u32], ink_rows: &[u32]) -> Vec<Tile> {
     let budget = OCR_LONG_SIDE_BUDGET.saturating_sub(TILE_PAD * 2).max(1);
     let xs = plan_cuts(w, budget, ink_cols);
@@ -187,13 +200,12 @@ pub fn plan_tiles(w: u32, h: u32, ink_cols: &[u32], ink_rows: &[u32]) -> Vec<Til
         for &(x0, x1) in &xs {
             let (tw, th) = (x1 - x0, y1 - y0);
             let padded = (tw + TILE_PAD * 2).max(th + TILE_PAD * 2).max(1);
-            let factor = (OCR_LONG_SIDE_BUDGET / padded).clamp(1, OCR_MAX_UPSCALE);
             out.push(Tile {
                 x: x0,
                 y: y0,
                 w: tw,
                 h: th,
-                factor,
+                scale: ocr_scale_for(padded),
             });
         }
     }
@@ -278,16 +290,34 @@ pub fn ink_profiles(img: &RgbaImage) -> (Vec<u32>, Vec<u32>) {
     (cols, rows)
 }
 
-/// 把整张截图切成送检瓦片：返回 (PNG 字节, 该块**内容原点**在原图中的 x, y, 放大倍数)。
+/// 一块已经准备好、可以直接送检的图。
+#[derive(Debug, Clone)]
+pub struct OcrTile {
+    /// 送检用的 PNG（已补边、已缩放）。
+    pub png: Vec<u8>,
+    /// 该块**内容原点**在原图中的坐标。⚠ **通常是负的**：四周补了 [`TILE_PAD`] 的背景边，
+    /// 块内坐标要减掉这一圈才对得回原图。
+    pub off_x: i32,
+    pub off_y: i32,
+    /// 送检时用的缩放倍数。换算回原图：`原图坐标 = 块内坐标 / scale + off`。
+    pub scale: f64,
+}
+
+/// 把整张截图切成送检瓦片（补边 + 缩放到用满预算）。
 ///
-/// ⚠ 返回的偏移是 **i32 且通常为负**：每块四周补了 [`TILE_PAD`] 的背景边，块内坐标要减掉
-/// 这一圈才对得回原图，即 `原图坐标 = 块内坐标 / factor + offset`，其中 `offset = t.x - PAD`。
-///
-/// 解码失败时退化成「原图一整块、不放大、不补边」——识别质量会差，但绝不能因此整个用不了。
-pub fn ocr_tiles(png: &[u8]) -> Vec<(Vec<u8>, i32, i32, u32)> {
+/// 解码失败时退化成「原图一整块、不缩放、不补边」——识别质量会差，但绝不能因此整个用不了。
+pub fn ocr_tiles(png: &[u8]) -> Vec<OcrTile> {
+    let fallback = || {
+        vec![OcrTile {
+            png: png.to_vec(),
+            off_x: 0,
+            off_y: 0,
+            scale: 1.0,
+        }]
+    };
     let img = match xcap::image::load_from_memory(png) {
         Ok(i) => i.to_rgba8(),
-        Err(_) => return vec![(png.to_vec(), 0, 0, 1)],
+        Err(_) => return fallback(),
     };
     let (w, h) = (img.width(), img.height());
     let (cols, rows) = ink_profiles(&img);
@@ -302,27 +332,31 @@ pub fn ocr_tiles(png: &[u8]) -> Vec<(Vec<u8>, i32, i32, u32)> {
         }
         let (cw, ch) = (canvas.width(), canvas.height());
         let dynimg = DynamicImage::ImageRgba8(canvas);
-        let dynimg = if t.factor > 1 {
-            dynimg.resize(
-                cw * t.factor,
-                ch * t.factor,
-                xcap::image::imageops::FilterType::Lanczos3,
-            )
+        // ⚠ `resize` 保持宽高比、缩到"框得下"为止，所以两边同乘同一个 scale 是安全的；
+        //   但要用 round 而不是截断，否则 1.54 这种小数倍会一点点地把坐标算歪。
+        let dynimg = if t.scale > 1.0001 {
+            let (nw, nh) = (
+                ((cw as f64) * t.scale).round().max(1.0) as u32,
+                ((ch as f64) * t.scale).round().max(1.0) as u32,
+            );
+            dynimg.resize(nw, nh, xcap::image::imageops::FilterType::Lanczos3)
         } else {
             dynimg
         };
+        // 实际缩放比按**产出尺寸**回算：resize 保持宽高比、还有取整，名义 scale 未必精确
+        let actual = dynimg.width() as f64 / cw as f64;
         let mut buf = Cursor::new(Vec::<u8>::new());
         if dynimg.write_to(&mut buf, ImageFormat::Png).is_ok() {
-            out.push((
-                buf.into_inner(),
-                t.x as i32 - TILE_PAD as i32,
-                t.y as i32 - TILE_PAD as i32,
-                t.factor,
-            ));
+            out.push(OcrTile {
+                png: buf.into_inner(),
+                off_x: t.x as i32 - TILE_PAD as i32,
+                off_y: t.y as i32 - TILE_PAD as i32,
+                scale: if actual.is_finite() && actual > 0.0 { actual } else { 1.0 },
+            });
         }
     }
     if out.is_empty() {
-        return vec![(png.to_vec(), 0, 0, 1)];
+        return fallback();
     }
     out
 }
@@ -476,40 +510,60 @@ mod tests {
         assert_covers(&segs, 1327, 960);
     }
 
-    /// 补边 + 放大之后仍不许超预算（尺寸口径一律按补边后算）。
+    /// 补边 + 缩放之后仍不许超预算（尺寸口径一律按补边后算）。
     fn assert_within_budget(t: &Tile) {
-        let padded = (t.w + TILE_PAD * 2).max(t.h + TILE_PAD * 2);
+        let padded = (t.w + TILE_PAD * 2).max(t.h + TILE_PAD * 2) as f64;
         assert!(
-            padded * t.factor <= OCR_LONG_SIDE_BUDGET,
-            "补边放大后超预算({padded}x{}): {t:?}",
-            t.factor
+            padded * t.scale <= OCR_LONG_SIDE_BUDGET as f64 + 1.0,
+            "补边缩放后超预算({padded}×{:.3}): {t:?}",
+            t.scale
         );
     }
 
+    /// **回归钉**：1327×49（＝用户那张截图的裁剪尺寸）现在必须**一整块送检**。
+    ///
+    /// 病史：预算是 960 那会儿它要切两块，切口落在字母中间还丢过字母；把预算提到 2048
+    /// 之后一次就读全了。同时缩放不再是整数档，而是"缩放到正好用满预算"。
     #[test]
-    fn tiles_upscale_only_while_staying_under_budget() {
-        // 小图：放大到不超预算为止（补边后 450，960/450 = 2）
-        let t = plan_tiles(434, 49, &[], &[]);
-        assert_eq!(t.len(), 1);
-        assert_eq!(t[0].factor, 2, "434 宽该放大 2 倍(补边后 900 仍在预算内)");
+    fn the_real_failing_width_is_now_a_single_tile() {
+        let t = plan_tiles(1327, 49, &[], &[]);
+        assert_eq!(t.len(), 1, "1327 宽不该再被切开: {t:?}");
+        assert!(
+            (t[0].scale - 2048.0 / 1343.0).abs() < 1e-6,
+            "该缩放到用满预算(2048/1343≈1.525)，实得 {:.3}",
+            t[0].scale
+        );
+        assert_within_budget(&t[0]);
+    }
 
-        // 极小图：倍数封顶
-        assert_eq!(plan_tiles(100, 30, &[], &[])[0].factor, 3);
+    #[test]
+    fn tiles_scale_up_to_fill_the_budget_and_cap_at_three() {
+        // 极小图：倍数封顶，不会放到天上去
+        let small = plan_tiles(100, 30, &[], &[]);
+        assert_eq!(small.len(), 1);
+        assert!((small[0].scale - OCR_MAX_UPSCALE).abs() < 1e-9, "该封顶: {small:?}");
 
-        // **旧规则的病灶**：1327 宽会被放大到 2654 —— 白算一遍还制造幻觉。
-        // 现在切成两块，每块 ~664，放大 1 倍(补边后 ×2 已超预算)。
-        let wide = plan_tiles(1327, 49, &[], &[]);
-        assert_eq!(wide.len(), 2, "1327 该切两块: {wide:?}");
-        for t in &wide {
-            assert_eq!(t.factor, 1);
-            assert_within_budget(t);
+        // 整屏：几乎原样（1920 已接近预算）
+        let full = plan_tiles(1920, 1080, &[], &[]);
+        assert_eq!(full.len(), 1, "1920 宽的整屏也该一整块: {full:?}");
+        assert!(full[0].scale > 1.0 && full[0].scale < 1.1);
+        assert_within_budget(&full[0]);
+    }
+
+    /// 比预算还大的截图（超宽屏/4K）仍要切块兜底。
+    #[test]
+    fn oversized_capture_still_falls_back_to_tiling() {
+        let t = plan_tiles(4000, 60, &[], &[]);
+        assert!(t.len() >= 2, "4000 宽必须切块: {t:?}");
+        for x in &t {
+            assert_within_budget(x);
         }
     }
 
     /// 瓦片必须严丝合缝地铺满整张图：面积之和 == 原图面积，且无重叠。
     #[test]
     fn tiles_partition_the_image_exactly() {
-        for (w, h) in [(1327u32, 49u32), (1920, 1080), (300, 200), (960, 960)] {
+        for (w, h) in [(1327u32, 49u32), (1920, 1080), (300, 200), (960, 960), (4000, 60)] {
             let tiles = plan_tiles(w, h, &[], &[]);
             let area: u64 = tiles.iter().map(|t| t.w as u64 * t.h as u64).sum();
             assert_eq!(area, w as u64 * h as u64, "{w}x{h} 的瓦片没铺满/铺重了");
@@ -527,15 +581,35 @@ mod tests {
         let png = blank_png(100, 40);
         let tiles = ocr_tiles(&png);
         assert_eq!(tiles.len(), 1);
-        let (bytes, ox, oy, f) = &tiles[0];
-        assert_eq!((*ox, *oy), (-(TILE_PAD as i32), -(TILE_PAD as i32)), "偏移要抵掉补边");
-        assert_eq!(*f, 3, "116x56 补边后可放大 3 倍");
-        let img = xcap::image::load_from_memory(bytes).expect("送检的块必须是可解码的 PNG");
+        let t = &tiles[0];
+        assert_eq!(
+            (t.off_x, t.off_y),
+            (-(TILE_PAD as i32), -(TILE_PAD as i32)),
+            "偏移要抵掉补边"
+        );
+        assert!((t.scale - 3.0).abs() < 1e-6, "116x56 该封顶到 3 倍，实得 {}", t.scale);
+        let img = xcap::image::load_from_memory(&t.png).expect("送检的块必须是可解码的 PNG");
         assert_eq!(
             (img.width(), img.height()),
-            ((100 + TILE_PAD * 2) * f, (40 + TILE_PAD * 2) * f),
+            ((100 + TILE_PAD * 2) * 3, (40 + TILE_PAD * 2) * 3),
             "尺寸应为 (原块 + 两侧补边) × 倍数"
         );
+    }
+
+    /// 缩放比必须按**产出尺寸**回算：`resize` 保宽高比 + 取整，名义倍数未必精确，
+    /// 直接拿名义值去除坐标会一点点地把框算歪。
+    #[test]
+    fn tile_scale_matches_the_actual_output_size() {
+        for (w, h) in [(100u32, 40u32), (1327, 49), (640, 480)] {
+            let t = &ocr_tiles(&blank_png(w, h))[0];
+            let img = xcap::image::load_from_memory(&t.png).unwrap();
+            let expected = img.width() as f64 / (w + TILE_PAD * 2) as f64;
+            assert!(
+                (t.scale - expected).abs() < 1e-9,
+                "{w}x{h}: scale={} 但产出宽度对应 {expected}",
+                t.scale
+            );
+        }
     }
 
     /// 诊断用：把 `ocr_tiles` 的实际产物写到磁盘，便于拿真 PaddleOCR 逐块比对。
@@ -557,11 +631,18 @@ mod tests {
         let img = xcap::image::load_from_memory(&png).expect("解码失败").to_rgba8();
         let bg = background_color(&img);
         println!("源图 {}x{}  背景色 rgba{:?}", img.width(), img.height(), bg.0);
-        for (i, (bytes, ox, oy, f)) in ocr_tiles(&png).into_iter().enumerate() {
+        for (i, t) in ocr_tiles(&png).into_iter().enumerate() {
             let p = format!("{dir}/dump_tile{i}.png");
-            std::fs::write(&p, &bytes).expect("写不出瓦片");
-            let t = xcap::image::load_from_memory(&bytes).unwrap();
-            println!("tile{i}: {}x{} off=({ox},{oy}) f={f} -> {p}", t.width(), t.height());
+            std::fs::write(&p, &t.png).expect("写不出瓦片");
+            let d = xcap::image::load_from_memory(&t.png).unwrap();
+            println!(
+                "tile{i}: {}x{} off=({},{}) scale={:.3} -> {p}",
+                d.width(),
+                d.height(),
+                t.off_x,
+                t.off_y,
+                t.scale
+            );
         }
     }
 

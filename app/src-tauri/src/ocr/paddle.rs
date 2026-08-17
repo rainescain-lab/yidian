@@ -47,6 +47,19 @@ impl Paddle {
     pub fn start(exe: &Path) -> Result<Self, String> {
         let dir = exe.parent().ok_or("PaddleOCR 路径异常")?;
         let mut cmd = Command::new(exe);
+        // ⚠ **`-limit_side_len` 必须和 `capture::OCR_LONG_SIDE_BUDGET` 一致。**
+        //
+        // 检测端会把送检图的长边压到这个值再检测（`-limit_type` 默认 `max`），
+        // 默认只有 960 —— 一条 1327×49 的截图条压完，11px 的字只剩 8px，
+        // 于是框碎、整段静默漏检（2026-08-15 的「对照不上」正是这么来的）。
+        // 调到 2048 之后同一张一次读全；整屏 1920×1080 的代价 760ms → 1080ms。
+        //
+        // 两边一旦不一致，`capture` 那边算好的"缩放到用满预算"就会被这边二次压缩，
+        // 白算一遍还看不出来 —— 所以这个值只有一个真相源。
+        cmd.arg(format!(
+            "--limit_side_len={}",
+            crate::capture::OCR_LONG_SIDE_BUDGET
+        ));
         cmd.current_dir(dir) // 模型是相对路径，需以 exe 目录为 cwd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -471,19 +484,26 @@ mod tests {
         let mut p = Paddle::start(&exe).expect("启动 PaddleOCR 失败");
 
         let tiles = crate::capture::ocr_tiles(&png);
-        println!("切成 {} 块", tiles.len());
-        assert!(tiles.len() >= 2, "这么宽的条必须切块，实得 {} 块", tiles.len());
+        println!(
+            "切成 {} 块 [{}]",
+            tiles.len(),
+            tiles
+                .iter()
+                .map(|t| format!("({},{})×{:.2}", t.off_x, t.off_y, t.scale))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
 
         let mut all = Vec::new();
-        for (tile, ox, oy, f) in tiles {
-            let b64 = STANDARD.encode(&tile);
+        for t in tiles {
+            let b64 = STANDARD.encode(&t.png);
             let mut lines = p.ocr_base64(&b64).expect("识别失败");
-            let fd = f.max(1) as f64;
+            let s = if t.scale > 0.0 { t.scale } else { 1.0 };
             for l in &mut lines {
-                l.x = l.x / fd + ox as f64;
-                l.y = l.y / fd + oy as f64;
-                l.w /= fd;
-                l.h /= fd;
+                l.x = l.x / s + t.off_x as f64;
+                l.y = l.y / s + t.off_y as f64;
+                l.w /= s;
+                l.h /= s;
             }
             all.append(&mut lines);
         }
