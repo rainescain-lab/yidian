@@ -54,8 +54,12 @@ function Shot() {
     l.rects && l.rects.length ? l.h / l.rects.length : l.h;
   // 字号**按每段自己的行高定**，不再全图统一：标题和正文本来就不一样大，
   // 统一成一个中位数必然一半偏大一半偏小（这是「看着歪」的一个来源）。
+  //
+  // ⚠ 系数 0.67 是配着后端 `det_db_unclip_ratio=2.0` 校准的。那个参数把检测框整体撑高
+  //   约 20%（为了不丢空格，见 paddle.rs 的注释），照旧用 0.8 的话译文会跟着大一圈。
+  //   两处必须同时改。
   const fontOf = (l: Line) =>
-    Math.max(13, Math.min(30, lineHeightOf(l) * dispScale * 0.8));
+    Math.max(13, Math.min(30, lineHeightOf(l) * dispScale * 0.67));
   const joinedSrc = p.lines.map((l) => l.src).join("\n");
   const joinedDst = p.lines
     .map((l) => l.dst)

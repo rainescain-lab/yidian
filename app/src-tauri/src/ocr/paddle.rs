@@ -60,6 +60,23 @@ impl Paddle {
             "--limit_side_len={}",
             crate::capture::OCR_LONG_SIDE_BUDGET
         ));
+        // ⚠ **`det_db_unclip_ratio` 调到 2.0 是为了不丢空格**（默认 1.5）。
+        //
+        // 病症：同一行英文，识别出来的空格时有时无 —— `context window. Try reading in
+        // smaller chunks, or use /clear to start fresh)` 会变成
+        // `contextwindow.Tryreadinginsmallerchunks,orusealeartostartfresh`，译文尾巴随之乱码。
+        //
+        // 2026-08-16 实测把变量锁死到了**检测框有多高**上：同一段文字只把选区上下各切掉几个
+        // 像素，框高 20px 时 12 个空格全对、19px 时只剩 3 个、**16px 时一个不剩**。
+        // 框越扁 ⇒ 送进识别端的图被拉得越长 ⇒ 空格被挤没。而框高正是这个参数控制的。
+        //
+        // 扫了 1.5/1.8/2.0/2.5/3.0 × 四种裁剪：**2.0 是第一个四个样本全对的值**。
+        // 不取更大是因为框会继续长高 —— 11px 的字行距只有 13~17px，框太高会粘上相邻行，
+        // 把两行判成一行。
+        //
+        // ⚠ 改这个值必须同步改前端的字号系数（`shot.tsx` 的 `fontOf`）：框高涨约 20%，
+        //   照旧乘 0.8 的话译文会跟着大一圈。
+        cmd.arg("--det_db_unclip_ratio=2.0");
         cmd.current_dir(dir) // 模型是相对路径，需以 exe 目录为 cwd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
